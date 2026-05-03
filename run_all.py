@@ -42,7 +42,9 @@ PAPER_SCRIPTS = [
       "--inv_hidden_dim", "256", "--fwd_hidden_dim", "512",
       "--num_interaction_layers", "8", "--gat_heads", "16",
       "--num_gnn_proc_layers", "4",
-      "--fwd_epochs", "500", "--warmup", "100", "--max_lambda", "100"],
+      "--inv_pretrain_epochs", "500",
+      "--fwd_pretrain_epochs", "500",
+      "--warmup", "100", "--max_lambda", "100"],
      "WaveGraphNet (Inverse Only)"),
 
     ("main_wavegraphnet.py",
@@ -50,7 +52,9 @@ PAPER_SCRIPTS = [
       "--inv_hidden_dim", "256", "--fwd_hidden_dim", "512",
       "--num_interaction_layers", "8", "--gat_heads", "16",
       "--num_gnn_proc_layers", "4",
-      "--fwd_epochs", "500", "--warmup", "100", "--max_lambda", "100"],
+      "--inv_pretrain_epochs", "500",
+      "--fwd_pretrain_epochs", "500",
+      "--warmup", "100", "--max_lambda", "100"],
      "WaveGraphNet (Coupled)")
 ]
 
@@ -81,7 +85,8 @@ def run_script(script_name, split, seed, quick_mode=False, extra_args=None):
     if quick_mode:
         _set_or_replace(cmd, "--epochs", "2")
         # Also reduce WaveGraphNet-specific long-running flags
-        for flag in ("--fwd_epochs", "--stage1_epochs", "--stage2_inv_epochs",
+        for flag in ("--fwd_epochs", "--inv_pretrain_epochs", "--fwd_pretrain_epochs",
+                     "--stage1_epochs", "--stage2_inv_epochs",
                      "--inv_per_cycle", "--fwd_per_cycle"):
             _set_or_replace(cmd, flag, "2")
 

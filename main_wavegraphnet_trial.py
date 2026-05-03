@@ -11,13 +11,14 @@ improving) predicted coordinates it will receive during Phase 2.
 
 This script replaces Phase 2 with a three-stage alternating curriculum:
 
-  Stage 1  (stage1_epochs)   Forward pre-training with GT coordinates.
-                              Focus-weighted MSE: L = mean(100*(de+0.01)*(ŷ-y)²)
-
-  Stage 2  (stage2_inv_epochs)  Inverse warmup — no forward consistency.
+  Stage 1  (stage1_epochs)   Inverse pre-training with coordinate loss ONLY.
                               L = MSE(pred_coords, true_coords)
-                              Lets the inverse branch establish a reasonable
-                              initialization before the forward signal kicks in.
+                              Establishes a good inverse initialization before
+                              the forward signal is introduced (paper Stage I).
+
+  Stage 2  (stage2_fwd_epochs)  Forward pre-training with GT coordinates.
+                              Focus-weighted MSE: L = mean(100*(de+0.01)*(ŷ-y)²)
+                              Learns to predict delta-E from known coords (paper Stage II).
 
   Stage 3  (stage3_cycles × cycle_len)  Alternating coupled training:
     ┌ INV phase (inv_per_cycle epochs per cycle)
@@ -36,8 +37,8 @@ This script replaces Phase 2 with a three-stage alternating curriculum:
     ... repeat each cycle
 
 Hyperparameters (all exposed as CLI flags):
-  --stage1_epochs     forward pre-training epochs        (default 500)
-  --stage2_inv_epochs inverse warmup epochs              (default 100)
+  --stage1_epochs     inverse pre-training epochs         (default 500)
+  --stage2_fwd_epochs forward pre-training epochs         (default 500)
   --stage3_cycles     number of alternating cycles       (default 8)
   --inv_per_cycle     inverse training epochs per cycle  (default 50)
   --fwd_per_cycle     forward fine-tuning epochs/cycle   (default 20)
@@ -267,7 +268,8 @@ def main():
     p.add_argument("--stage1_epochs",     type=int,      default=500)
 
     # Stage 2: inverse warmup
-    p.add_argument("--stage2_inv_epochs", type=int,      default=100)
+    p.add_argument("--stage2_fwd_epochs", type=int,      default=500,
+                   help="Stage 2: forward pre-training epochs")
 
     # Stage 3: alternating cycles
     p.add_argument("--stage3_cycles",     type=int,      default=8,
@@ -296,7 +298,7 @@ def main():
 
     print(f"\n{'='*65}")
     print(f"  {LABEL} | split={args.split} seed={args.seed}")
-    print(f"  Stage1={args.stage1_epochs}ep | Stage2={args.stage2_inv_epochs}ep | "
+    print(f"  Stage1={args.stage1_epochs}ep | Stage2={args.stage2_fwd_epochs}ep | "
           f"Stage3={args.stage3_cycles}×({args.inv_per_cycle}inv+{args.fwd_per_cycle}fwd)")
     print(f"  λ-warmup={args.warmup_cycles} cycles | λ-max={args.max_lambda} | "
           f"lr={args.lr} lr_fwd_refine={args.lr_fwd_refine}")
@@ -379,49 +381,59 @@ def main():
 
     # ── Stage 1: forward pre-training ─────────────────────────────────────────
     print(f"\n{'─'*65}")
-    print(f"  STAGE 1: Forward pre-training ({args.stage1_epochs} epochs)")
+    print(f"  STAGE 1: Inverse pre-training ({args.stage1_epochs} epochs)   [paper Stage I]")
     print(f"{'─'*65}", flush=True)
 
-    opt_fwd_s1 = optim.Adam(fwd_model.parameters(), lr=args.lr)
-    sch_fwd_s1 = optim.lr_scheduler.ReduceLROnPlateau(opt_fwd_s1, factor=0.8, patience=20)
-    best_s1_loss = float("inf")
+    opt_inv_s1  = optim.Adam(inv_model.parameters(), lr=args.lr)
+    sch_inv_s1  = optim.lr_scheduler.ReduceLROnPlateau(opt_inv_s1, factor=0.8, patience=20)
+    best_s1_mae = float("inf")
 
     for ep in range(1, args.stage1_epochs + 1):
         global_epoch += 1
-        fl = train_stage1_fwd(fwd_model, tr, opt_fwd_s1, prop_ei, device)
-        sch_fwd_s1.step(fl)
+        il = train_stage2_inv(inv_model, tr, opt_inv_s1, device)
 
         if ep % args.val_every == 0 or ep in (1, args.stage1_epochs):
-            print(f"  [S1 Fwd] Ep {ep:04d} | FwdLoss={fl:.6f} "
-                  f"| LR={opt_fwd_s1.param_groups[0]['lr']:.2e}", flush=True)
+            vm  = euclidean_mae(inv_model, vl, device)
+            vmm = vm * PLATE_MM
+            sch_inv_s1.step(vm)
+            tm, tmm = evaluate_test(inv_model, te, device)
+            logger.log(global_epoch, "S1_inv", il, vm, vmm, tm, tmm,
+                       lambda_fwd=0.0, lr=opt_inv_s1.param_groups[0]["lr"])
+            checkpoint_if_best(vm, vmm, tm, tmm, tag="S1")
+            if vmm < best_s1_mae:
+                best_s1_mae = vmm
+                torch.save(inv_model.state_dict(), ckpt_fwd)  # reuse ckpt_fwd path
 
-        if fl < best_s1_loss:
-            best_s1_loss = fl
-            torch.save(fwd_model.state_dict(), ckpt_fwd)
-
-    print(f"  Stage 1 complete. Best fwd loss={best_s1_loss:.6f} → loading.", flush=True)
-    fwd_model.load_state_dict(torch.load(ckpt_fwd, map_location=device))
+    print(f"  Stage 1 complete. Best val MAE={best_s1_mae:.1f}mm → loading.", flush=True)
+    inv_model.load_state_dict(torch.load(ckpt_fwd, map_location=device))
 
     # ── Stage 2: inverse warmup ───────────────────────────────────────────────
     print(f"\n{'─'*65}")
-    print(f"  STAGE 2: Inverse warmup — no forward loss ({args.stage2_inv_epochs} epochs)")
+    print(f"  STAGE 2: Forward pre-training ({args.stage2_fwd_epochs} epochs)   [paper Stage II]")
     print(f"{'─'*65}", flush=True)
 
+    opt_fwd_s2  = optim.Adam(fwd_model.parameters(), lr=args.lr)
+    sch_fwd_s2  = optim.lr_scheduler.ReduceLROnPlateau(opt_fwd_s2, factor=0.8, patience=20)
+    best_s2_fwd = float("inf")
+    ckpt_fwd_s2 = ckpt_best.replace(".pt", "_fwd_s2.pt")
+
+    for ep in range(1, args.stage2_fwd_epochs + 1):
+        global_epoch += 1
+        fl = train_stage1_fwd(fwd_model, tr, opt_fwd_s2, prop_ei, device)
+        sch_fwd_s2.step(fl)
+
+        if ep % args.val_every == 0 or ep in (1, args.stage2_fwd_epochs):
+            print(f"  [S2 Fwd] Ep {ep:04d} | FwdLoss={fl:.6f} "
+                  f"| LR={opt_fwd_s2.param_groups[0]['lr']:.2e}", flush=True)
+        if fl < best_s2_fwd:
+            best_s2_fwd = fl
+            torch.save(fwd_model.state_dict(), ckpt_fwd_s2)
+
+    print(f"  Stage 2 complete. Best fwd loss={best_s2_fwd:.6f} → loading.", flush=True)
+    fwd_model.load_state_dict(torch.load(ckpt_fwd_s2, map_location=device))
+    # Re-initialize opt_inv for Stage 3
     opt_inv = optim.Adam(inv_model.parameters(), lr=args.lr)
     sch_inv = optim.lr_scheduler.ReduceLROnPlateau(opt_inv, factor=0.8, patience=20)
-
-    for ep in range(1, args.stage2_inv_epochs + 1):
-        global_epoch += 1
-        il = train_stage2_inv(inv_model, tr, opt_inv, device)
-
-        if ep % args.val_every == 0 or ep in (1, args.stage2_inv_epochs):
-            vm  = euclidean_mae(inv_model, vl, device)
-            vmm = vm * PLATE_MM
-            sch_inv.step(vm)
-            tm, tmm = evaluate_test(inv_model, te, device)
-            logger.log(global_epoch, "S2_inv", il, vm, vmm, tm, tmm,
-                       lambda_fwd=0.0, lr=opt_inv.param_groups[0]["lr"])
-            checkpoint_if_best(vm, vmm, tm, tmm, tag="S2")
 
     # ── Stage 3: alternating coupled training ─────────────────────────────────
     print(f"\n{'─'*65}")
@@ -487,8 +499,8 @@ def main():
     print(f"\n{'='*65}")
     print(f"  {LABEL} | split={args.split} seed={args.seed}")
     print(f"  Total epochs: Stage1={args.stage1_epochs} + "
-          f"Stage2={args.stage2_inv_epochs} + "
-          f"Stage3={total_stage3} = {args.stage1_epochs + args.stage2_inv_epochs + total_stage3}")
+          f"Stage2={args.stage2_fwd_epochs} + "
+          f"Stage3={total_stage3} = {args.stage1_epochs + args.stage2_fwd_epochs + total_stage3}")
     print(f"  Best val MAE : {best_val_mae:.1f} mm")
     print(f"  Best test MAE: {best_test_mae:.1f} mm")
     print(f"  Best test MSE: {best_test_mse:.5f}")

@@ -1,0 +1,9 @@
+
+=================================================================
+  WaveGraphNet (Trial) | split=B seed=42
+Traceback (most recent call last):
+  File "/home/visharma/gnn/WAVEGRAPHNET/main_wavegraphnet_trial.py", line 511, in <module>
+    main()
+  File "/home/visharma/gnn/WAVEGRAPHNET/main_wavegraphnet_trial.py", line 301, in main
+    print(f"  Stage1={args.stage1_epochs}ep | Stage2={args.stage2_inv_epochs}ep | "
+AttributeError: 'Namespace' object has no attribute 'stage2_inv_epochs'. Did you mean: 'stage2_fwd_epochs'?
