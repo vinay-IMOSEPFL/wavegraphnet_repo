@@ -20,13 +20,13 @@ PAPER_GLOBAL_ARGS = [
 
 # (script, script-specific args, display label)
 PAPER_SCRIPTS = [
-    # ("main_cnn.py",
-    #  [],
-    #  "1D CNN"),
+    ("main_cnn.py",
+     [],
+     "1D CNN"),
 
-    # ("main_lstm.py",
-    #  ["--lstm_hidden_dim", "256", "--num_lstm_layers", "3", "--dropout", "0.3"],
-    #  "LSTM"),
+    ("main_lstm.py",
+     ["--lstm_hidden_dim", "256", "--num_lstm_layers", "3", "--dropout", "0.3"],
+     "LSTM"),
 
     ("main_gnn_baselines.py",
      ["--model", "simple_mlp", "--hidden_dim", "256", "--num_gnn_layers", "4"],
@@ -80,6 +80,10 @@ def run_script(script_name, split, seed, quick_mode=False, extra_args=None):
         cmd.extend(extra_args)
     if quick_mode:
         _set_or_replace(cmd, "--epochs", "2")
+        # Also reduce WaveGraphNet-specific long-running flags
+        for flag in ("--fwd_epochs", "--stage1_epochs", "--stage2_inv_epochs",
+                     "--inv_per_cycle", "--fwd_per_cycle"):
+            _set_or_replace(cmd, flag, "2")
 
     print(f"\n{'=' * 65}")
     print(f"Executing: {' '.join(cmd)}")
@@ -120,6 +124,56 @@ def print_leaderboard(split, seeds, results_path="results.json"):
         mean = statistics.mean(losses)
         std  = statistics.stdev(losses) if len(losses) > 1 else 0.0
         print(f"{model:<36} | {mean:>10.6f} | {std:>8.6f}")
+
+
+def print_mae_leaderboard(split, seeds, results_path="results_mae.json"):
+    """Print mean ± std MAE (mm) across seeds from results_mae.json."""
+    import statistics as st
+    if not os.path.exists(results_path):
+        print("results_mae.json not found — no MAE summary available.")
+        return
+
+    with open(results_path) as f:
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError:
+            print("Could not read results_mae.json.")
+            return
+
+    split_data = data.get(split, {})
+    if not split_data:
+        print(f"No MAE results logged for Split {split}.")
+        return
+
+    rows = []
+    for model_name, entries in split_data.items():
+        maes = [e["test_mae_mm"] for e in entries
+                if isinstance(e, dict) and "test_mae_mm" in e]
+        if maes:
+            rows.append((model_name, st.mean(maes),
+                         st.stdev(maes) if len(maes) > 1 else 0.0,
+                         len(maes)))
+
+    rows.sort(key=lambda r: r[1])
+
+    print(f"\n\n{'='*65}")
+    print(f"  FINAL MAE RESULTS  |  SPLIT {split}  |  seeds={seeds}")
+    print(f"{'='*65}")
+    print(f"{'Model Name':<38} | {'Mean MAE':>10} | {'Std':>8} | n")
+    print("-" * 65)
+    for name, mean, std, n in rows:
+        print(f"{name:<38} | {mean:>8.1f}mm | {std:>6.1f}mm | {n}")
+    print(f"{'='*65}")
+
+    # Also write to a log file for nohup runs
+    log_path = f"mae_summary_split{split}.log"
+    with open(log_path, "w") as f:
+        f.write(f"SPLIT {split} | seeds={seeds}\n")
+        f.write(f"{'Model':<38} | {'Mean MAE':>10} | {'Std':>8}\n")
+        f.write("-" * 65 + "\n")
+        for name, mean, std, n in rows:
+            f.write(f"{name:<38} | {mean:>8.1f}mm | {std:>6.1f}mm\n")
+    print(f"[Saved] MAE summary → {log_path}", flush=True)
 
 
 def main():
@@ -174,15 +228,17 @@ def main():
     # ------------------------------------------------------------------ #
     # Clear previous results for this split                                #
     # ------------------------------------------------------------------ #
-    if not args.quick and os.path.exists("results.json"):
-        with open("results.json", "r") as f:
-            try:
-                all_results = json.load(f)
-            except json.JSONDecodeError:
-                all_results = {}
-        all_results.pop(args.split, None)
-        with open("results.json", "w") as f:
-            json.dump(all_results, f, indent=4)
+    if not args.quick:
+        for rfile in ("results.json", "results_mae.json"):
+            if os.path.exists(rfile):
+                with open(rfile, "r") as f:
+                    try:
+                        all_results = json.load(f)
+                    except json.JSONDecodeError:
+                        all_results = {}
+                all_results.pop(args.split, None)
+                with open(rfile, "w") as f:
+                    json.dump(all_results, f, indent=4)
 
     # ------------------------------------------------------------------ #
     # Data preparation                                                      #
@@ -223,6 +279,7 @@ def main():
     # Leaderboard                                                           #
     # ------------------------------------------------------------------ #
     print_leaderboard(args.split, seeds)
+    print_mae_leaderboard(args.split, seeds)
 
 
 if __name__ == "__main__":
