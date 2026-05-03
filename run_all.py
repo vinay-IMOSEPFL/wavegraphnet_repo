@@ -51,11 +51,7 @@ PAPER_SCRIPTS = [
       "--num_interaction_layers", "8", "--gat_heads", "16",
       "--num_gnn_proc_layers", "4",
       "--fwd_epochs", "500", "--warmup", "100", "--max_lambda", "100"],
-     "WaveGraphNet (Coupled)"),
-
-    ("main_wavegraphnet_new.py",
-     ["--mode", "coupled", "--fwd_epochs", "500"],
-     "WaveGraphNet (Improved)"),
+     "WaveGraphNet (Coupled)")
 ]
 
 # Default scripts (when --paper is NOT set)
@@ -65,7 +61,6 @@ DEFAULT_SCRIPTS = [
     ("main_gnn_baselines.py",    [],                         "GNN (simple_mlp)"),
     ("main_wavegraphnet.py",     ["--mode", "inverse_only"], "WaveGraphNet (Inverse Only)"),
     ("main_wavegraphnet.py",     ["--mode", "coupled"],      "WaveGraphNet (Coupled)"),
-    ("main_wavegraphnet_new.py", ["--mode", "coupled"],      "WaveGraphNet (Improved)"),
 ]
 # ---------------------------------------------------------------------------
 

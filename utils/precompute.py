@@ -24,9 +24,9 @@ N_ATTENTION_FREQS    = 256
 NUM_TRANSDUCERS      = 12
 NUM_DATA_COLUMNS     = 66
 
-# ── Fixed FFT bin indices (computed once at import) ────────────────────────────
+# ── Fixed FFT bin indices (computed once at import) ───────────────────────────
 def _compute_fixed_fft_bin_indices():
-    freqs = scipy.fft.rfftfreq(LOOKBACK_POINTS, d=1.0 / SAMPLING_RATE)
+    freqs   = scipy.fft.rfftfreq(LOOKBACK_POINTS, d=1.0 / SAMPLING_RATE)
     targets = np.linspace(MIN_FREQ_HZ, MAX_FREQ_HZ, N_ATTENTION_FREQS)
     return np.array([np.argmin(np.abs(freqs - f)) for f in targets], dtype=np.int64)
 
@@ -51,8 +51,8 @@ def build_normalized_differential_data(
     baseline_train_ids = [s for s in train_ids if "baseline" in s]
 
     # Step 0 – average baseline from training baselines only
-    min_len = min(raw_data_map[s].shape[0] for s in baseline_train_ids)
-    stacked = np.stack([raw_data_map[s][:min_len] for s in baseline_train_ids], axis=0)
+    min_len  = min(raw_data_map[s].shape[0] for s in baseline_train_ids)
+    stacked  = np.stack([raw_data_map[s][:min_len] for s in baseline_train_ids], axis=0)
     average_raw_baseline = stacked.mean(axis=0).astype(np.float32)
 
     # Step 0b – subtract baseline from every sample
@@ -99,7 +99,7 @@ def compute_amp_stats(
                 amps_list[pair_j][fi].append(float(amps_at_bins[fi]))
 
     amp_means = np.zeros((n_pairs, n_freqs), dtype=np.float32)
-    amp_stds  = np.ones((n_pairs, n_freqs), dtype=np.float32)
+    amp_stds  = np.ones( (n_pairs, n_freqs), dtype=np.float32)
     for pj in range(n_pairs):
         for fi in range(n_freqs):
             vals = amps_list[pj][fi]
@@ -110,7 +110,7 @@ def compute_amp_stats(
     return amp_means, amp_stds
 
 
-# ── Step 3: Average baseline energy profile ────────────────────────────────────
+# ── Step 3: Average baseline energy profile ───────────────────────────────────
 def compute_baseline_energy_profile(
     normalized_data_map: dict,
     train_ids: list,
@@ -160,21 +160,30 @@ def compute_global_max_delta_e(
     return max(max_val, 1e-6)
 
 
-# ── Edge/graph topology helpers ────────────────────────────────────────────────
+# ── Edge/graph topology helpers ───────────────────────────────────────────────
 def get_propagation_edge_index_and_col_idxs(
     num_transducers: int = NUM_TRANSDUCERS,
 ) -> tuple[torch.Tensor, list, torch.Tensor]:
-    """Top↔bottom propagation paths only (36 pairs, 72 directed edges)."""
-    top    = set(range(num_transducers // 2))
-    bottom = set(range(num_transducers // 2, num_transducers))
+    """
+    Top↔bottom propagation paths only (36 pairs, 72 directed edges).
+
+    BUG FIX: iterate over sorted() lists, not sets, to guarantee deterministic
+    ordering. The DirectPathAttenuationGNN reshape view(B, 36, 2, 1) depends on
+    edges being in a consistent pair order across runs.
+    """
+    top    = sorted(range(num_transducers // 2))           # [0,1,2,3,4,5]
+    bottom = sorted(range(num_transducers // 2, num_transducers))  # [6,7,8,9,10,11]
+
     all_pairs   = list(itertools.combinations(range(num_transducers), 2))
     pair_to_col = {p: i for i, p in enumerate(all_pairs)}
+
     edges, col_idxs = [], []
     for i in top:
         for j in bottom:
-            for u, v in [(i, j), (j, i)]:
+            for u, v in [(i, j), (j, i)]:   # both directions; adjacent → view works
                 edges.append([u, v])
                 col_idxs.append(pair_to_col[tuple(sorted((u, v)))])
+
     prop_ei      = torch.tensor(edges, dtype=torch.long).t().contiguous()
     unique_cols  = torch.tensor(sorted(set(col_idxs)), dtype=torch.long)
     return prop_ei, col_idxs, unique_cols
@@ -201,13 +210,12 @@ def build_all_stats(raw_data_map: dict, train_ids: list) -> dict:
     """
     Build all statistics for a given split from the raw data map.
     Call once per split at the top of each main_*.py script.
+    Returns stats dict; always use stats["normalized_data_map"] for datasets.
     """
     from utils.data_loader import get_k_graph_edge_index
 
-    print("─ Step 0+1: Time-domain preprocessing (baseline subtraction + normalization) …")
-    norm_data, avg_baseline_raw, diff_mean, diff_std = build_normalized_differential_data(
-        raw_data_map, train_ids
-    )
+    print("─ Step 0+1: Baseline subtraction + time-domain z-normalization …")
+    norm_data, _, _, _ = build_normalized_differential_data(raw_data_map, train_ids)
 
     print("─ Step 2: Per-(pair,freq) amplitude statistics …")
     amp_means, amp_stds = compute_amp_stats(norm_data, train_ids)
@@ -215,7 +223,7 @@ def build_all_stats(raw_data_map: dict, train_ids: list) -> dict:
     print("─ Step 3: Average baseline energy profile …")
     avg_bl = compute_baseline_energy_profile(norm_data, train_ids, amp_means, amp_stds)
 
-    print("─ Building propagation edge index …")
+    print("─ Building propagation edge index (sorted, deterministic) …")
     prop_ei, prop_col_idxs, prop_unique = get_propagation_edge_index_and_col_idxs()
 
     print("─ Step 4: Global max ΔE …")
@@ -224,24 +232,21 @@ def build_all_stats(raw_data_map: dict, train_ids: list) -> dict:
     )
     print(f"  global_max_delta_e = {g_max:.6f}")
 
-    k12 = get_k_graph_edge_index(NUM_TRANSDUCERS, self_loops=False)
+    k12          = get_k_graph_edge_index(NUM_TRANSDUCERS, self_loops=False)
     inv_col_idxs = get_inv_edge_feature_col_idxs(k12)
 
     return dict(
-        # Preprocessed data (MUST be used in datasets instead of raw_data_map)
-        normalized_data_map           = norm_data,
-        # Stats
-        fixed_fft_bin_indices         = FIXED_FFT_BIN_INDICES,
-        amp_means                     = amp_means,
-        amp_stds                      = amp_stds,
-        average_baseline_energy_profile = avg_bl,
-        global_max_delta_e            = g_max,
-        # Graph topology
-        propagation_edge_index        = prop_ei,
-        propagation_col_idxs          = prop_col_idxs,
-        propagation_pair_indices      = prop_unique,
-        k12_edge_index                = k12,
-        inv_edge_feature_col_idxs     = inv_col_idxs,
-        lookback_fft                  = LOOKBACK_POINTS,
-        num_fft_bins                  = N_ATTENTION_FREQS,
+        normalized_data_map             = norm_data,   # ← use this in ALL datasets
+        fixed_fft_bin_indices           = FIXED_FFT_BIN_INDICES,
+        amp_means                       = amp_means,   # [66, 256]
+        amp_stds                        = amp_stds,    # [66, 256]
+        average_baseline_energy_profile = avg_bl,      # Tensor [66, 256]
+        global_max_delta_e              = g_max,
+        propagation_edge_index          = prop_ei,     # [2, 72]
+        propagation_col_idxs            = prop_col_idxs,
+        propagation_pair_indices        = prop_unique, # Tensor [36]
+        k12_edge_index                  = k12,         # [2, 132]
+        inv_edge_feature_col_idxs       = inv_col_idxs,
+        lookback_fft                    = LOOKBACK_POINTS,
+        num_fft_bins                    = N_ATTENTION_FREQS,
     )
