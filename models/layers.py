@@ -88,3 +88,4 @@ class RichEdgeConv(MessagePassing):
 
     def update(self, aggr_out, x):
         return self.mlp_update(torch.cat([x, aggr_out], dim=1))
+

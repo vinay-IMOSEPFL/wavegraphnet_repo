@@ -161,6 +161,8 @@ def compute_global_max_delta_e(
 
 
 # ── Edge/graph topology helpers ───────────────────────────────────────────────
+
+
 def get_propagation_edge_index_and_col_idxs(
     num_transducers: int = NUM_TRANSDUCERS,
 ) -> tuple[torch.Tensor, list, torch.Tensor]:

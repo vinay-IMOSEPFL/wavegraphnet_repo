@@ -1,29 +1,26 @@
 """
-WaveGraphNet — standard training script.
+WaveGraphNet — faithful implementation of the coupling-models.ipynb notebook.
 
-Implements the EXACT 3-stage training from the paper (Table 2 / Section 4.4):
+Training protocol (exactly as in the notebook):
 
-  Stage I   (--inv_pretrain_epochs):
-    Inverse branch trained alone.
-    Optimizer: inv_model only.
-    Loss: Lloc = MSE(pred_coords, true_coords)
+  Phase 1  (--fwd_pretrain_epochs, default 500):
+    Pre-train forward model with ground-truth coordinates.
+    Loss: focus-weighted MSE on delta-E.
+    Optimizer: opt_fwd (fwd params only).
+    inv_model is untouched.
 
-  Stage II  (--fwd_pretrain_epochs):
-    Forward branch trained alone with GROUND-TRUTH coordinates.
-    Optimizer: fwd_model only.
-    Loss: Lfwd (focus-weighted MSE on delta-E)
+  Phase 2  (--epochs, default 500):
+    Train inv_model with combined loss.
+    gnn_inv.train(), gnn_fwd.eval() — fwd FROZEN throughout.
+    optimizer_inv contains ONLY inv_model parameters.
+    Loss: Lloc + lambda(epoch) * Lfwd
+    Gradient from Lfwd flows through predicted_locs INTO inv_model
+    (NO detach — this is the physics consistency signal).
+    lambda anneals 0 → max_lambda after warmup_epochs.
+    Scheduler steps on eval MAE.
+    Best checkpoint by val MAE.
 
-  Stage III (--epochs):
-    BOTH branches jointly optimized together.
-    Optimizer: inv_model + fwd_model parameters TOGETHER.
-    Loss: Ltotal = Lloc + lambda(epoch) * Lfwd
-    Lambda anneals 0 → max_lambda over warmup epochs.
-    Scheduler steps on val Euclidean MAE.
-    Best checkpoint saved by val MAE.
-
-This is the correct implementation. The previous version had Stage I and II
-swapped, and Stage III was never done (forward was frozen in the "coupled" phase
-so only inverse was updated, making Coupled == Inverse Only with a noisy extra loss).
+Note: INV_ONLY_EPOCHS=0 in the notebook — no separate inverse pre-training.
 """
 import argparse, sys, random, pickle, os
 import torch, torch.nn as nn, torch.optim as optim
@@ -51,14 +48,13 @@ def set_seed(s):
 
 
 def get_lambda(epoch, total, warmup, max_lam):
-    """Linear annealing 0 → max_lam after warmup epochs."""
-    if epoch < warmup:
-        return 0.0
+    """Notebook get_lambda: linear ramp 0 → max_lam after warmup."""
+    if epoch < warmup: return 0.0
     dur = total - warmup
     return min((epoch - warmup) / dur * max_lam, max_lam) if dur > 0 else max_lam
 
 
-def make_fwd_batch(data_inv: Batch, prop_ei: torch.Tensor, device) -> Batch:
+def make_fwd_batch(data_inv, prop_ei, device):
     prop_ei = prop_ei.to(device)
     return Batch.from_data_list([
         PyGData(x=data_inv.x[data_inv.batch == i], edge_index=prop_ei)
@@ -66,102 +62,80 @@ def make_fwd_batch(data_inv: Batch, prop_ei: torch.Tensor, device) -> Batch:
     ]).to(device)
 
 
-# ── Stage I: inverse pre-training ─────────────────────────────────────────────
-def train_stage1_inv(inv_model, loader, opt_inv, device) -> float:
-    """
-    Paper Stage I: train inverse branch alone.
-    Loss = MSE(pred_coords, true_coords)
-    """
-    inv_model.train()
-    crit = nn.MSELoss()
-    total = 0.0
-    for batch in tqdm(loader, leave=False, disable=_TQDM_DISABLE):
-        opt_inv.zero_grad()
-        di = batch["data_inv"].to(device)
-        yt = batch["y_true"].to(device).squeeze(1)   # [B, 2]
-        loss = crit(inv_model(di), yt)
-        loss.backward(); opt_inv.step()
-        total += loss.item() * di.num_graphs
-    return total / len(loader.dataset)
-
-
-# ── Stage II: forward pre-training ────────────────────────────────────────────
-def train_stage2_fwd(fwd_model, loader, opt_fwd, prop_ei, device) -> float:
-    """
-    Paper Stage II: train forward branch alone with ground-truth coordinates.
-    Loss = focus-weighted MSE on delta-E.
-    """
+# ── Phase 1: forward pre-training ─────────────────────────────────────────────
+def train_phase1_fwd(fwd_model, loader, opt_fwd, prop_ei, device):
+    """Notebook train_phase1_attenuation: focus-weighted MSE with GT coords."""
     fwd_model.train()
     total = 0.0
     for batch in tqdm(loader, leave=False, disable=_TQDM_DISABLE):
         opt_fwd.zero_grad()
         di = batch["data_inv"].to(device)
-        yt = batch["y_true"].to(device).squeeze(1)   # [B, 2] — GT coords for fwd
-        de = batch["delta_e_true"].to(device)         # [B, 36]
+        yt = batch["y_true"].to(device).squeeze(1)   # [B, 2] GT coords
+        de = batch["delta_e_true"].to(device)
         gf = make_fwd_batch(di, prop_ei, device)
-        pd = fwd_model(gf, yt)                        # [B, 36]
         w  = de + 0.01
-        loss = (100.0 * w * (pd - de) ** 2).mean()
+        loss = (100.0 * w * (fwd_model(gf, yt) - de) ** 2).mean()
         loss.backward(); opt_fwd.step()
         total += loss.item() * di.num_graphs
     return total / len(loader.dataset)
 
 
-# ── Stage III: joint coupled training ─────────────────────────────────────────
-def train_stage3_joint(inv_model, fwd_model, loader, opt_joint, lam,
-                       prop_ei, device) -> tuple[float, float]:
-    """
-    Paper Stage III: BOTH branches optimized jointly.
-    Inverse predicts coords → forward receives predicted coords → joint loss.
-    optimizer_joint contains parameters from BOTH inv_model AND fwd_model.
-    Loss: Ltotal = Lloc + lambda * Lfwd
-    """
+# ── Phase 2: inverse training with frozen forward ─────────────────────────────
+def train_phase2_inv(inv_model, fwd_model, loader, opt_inv,
+                     loss_fn_inv, loss_fn_fwd, lambda_fwd, prop_ei, device):
     inv_model.train()
-    fwd_model.train()   # ← BOTH training, unlike the old frozen version
-    crit    = nn.MSELoss()
+    fwd_model.eval()
+    crit = nn.MSELoss()
     tot_inv = tot_fwd = 0.0
 
     for batch in tqdm(loader, leave=False, disable=_TQDM_DISABLE):
-        opt_joint.zero_grad()
+        opt_inv.zero_grad()
         di = batch["data_inv"].to(device)
-        yt = batch["y_true"].to(device).squeeze(1)   # [B, 2]
-        de = batch["delta_e_true"].to(device)         # [B, 36]
+        yt = batch["y_true"].to(device).squeeze(1)
+        de = batch["delta_e_true"].to(device)
 
-        pc    = inv_model(di)                         # [B, 2]  predicted coords
-        l_inv = crit(pc, yt)                          # localization loss
+        predicted_locs = inv_model(di)
 
-        gf    = make_fwd_batch(di, prop_ei, device)
-        l_fwd = crit(fwd_model(gf, pc), de)           # forward consistency loss
+        dmg_mask = yt[:, 0] > 0
+        ud_mask  = ~dmg_mask
 
-        loss  = l_inv + lam * l_fwd
-        loss.backward()
-        # Clip gradients for both models
-        torch.nn.utils.clip_grad_norm_(inv_model.parameters(), 1.0)
-        torch.nn.utils.clip_grad_norm_(fwd_model.parameters(), 1.0)
-        opt_joint.step()
+        # Damaged: exact coordinate regression
+        loss_inv = crit(predicted_locs[dmg_mask], yt[dmg_mask]) \
+                   if dmg_mask.any() else torch.tensor(0.0, device=device)
+
+        # Undamaged: soft plate-exit penalty (not exact sentinel)
+        if ud_mask.any():
+            px = torch.clamp(predicted_locs[ud_mask, 0], min=0.0)
+            py = torch.clamp(predicted_locs[ud_mask, 1], min=0.0)
+            loss_inv = loss_inv + (px**2 + py**2).mean()
+
+        # Forward consistency on damaged only
+        loss_fwd = torch.tensor(0.0, device=device)
+        if lambda_fwd > 0 and dmg_mask.any():
+            gf = make_fwd_batch(di, prop_ei, device)
+            loss_fwd = loss_fn_fwd(
+                fwd_model(gf, predicted_locs)[dmg_mask], de[dmg_mask])
+
+        (loss_inv + lambda_fwd * loss_fwd).backward()
+        opt_inv.step()
 
         n = di.num_graphs
-        tot_inv += l_inv.item() * n
-        tot_fwd += l_fwd.item() * n
+        tot_inv += loss_inv.item() * n
+        tot_fwd += loss_fwd.item() * n
 
     n = len(loader.dataset)
     return tot_inv / n, tot_fwd / n
 
 
-# ── Evaluation: Euclidean MAE over damaged samples only ───────────────────────
-def euclidean_mae(model, loader, device) -> float:
-    """Returns normalised MAE (multiply by PLATE_MM for mm)."""
-    model.eval()
-    total = 0.0; count = 0
+def euclidean_mae(model, loader, device):
+    model.eval(); total = 0.0; count = 0
     with torch.no_grad():
         for batch in loader:
             di   = batch["data_inv"].to(device)
-            yt   = batch["y_true"].to(device).squeeze(1)   # [B, 2]
-            mask = yt[:, 0] > 0                             # damaged only
-            if not mask.any():
-                continue
-            pred  = model(di)[mask]
-            true  = yt[mask]
+            yt   = batch["y_true"].to(device).squeeze(1)
+            mask = yt[:, 0] > 0
+            if not mask.any(): continue
+            pred  = model(di)[mask]; true = yt[mask]
             total += torch.sqrt(((pred - true) ** 2).sum(dim=1)).mean().item()
             count += 1
     return (total / count) if count > 0 else float("nan")
@@ -169,36 +143,34 @@ def euclidean_mae(model, loader, device) -> float:
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--split",                  default="A", choices=["A", "B"])
-    p.add_argument("--mode",                   default="coupled",
+    p.add_argument("--split",               default="A", choices=["A", "B"])
+    p.add_argument("--mode",                default="coupled",
                    choices=["coupled", "inverse_only"])
-
-    # Stage epoch counts (paper uses 500 for each)
-    p.add_argument("--inv_pretrain_epochs", type=int,  default=500,
-                   help="Stage I: inverse pre-training epochs")
     p.add_argument("--fwd_pretrain_epochs", type=int,  default=500,
-                   help="Stage II: forward pre-training epochs")
+                   help="Phase 1: forward pre-training (notebook EPOCHS_PHASE_1)")
     p.add_argument("--epochs",              type=int,  default=500,
-                   help="Stage III: joint coupled training epochs")
-
-    # CLI alias for run_all.py compatibility (--fwd_epochs maps to fwd_pretrain_epochs)
-    p.add_argument("--fwd_epochs",          type=int,  default=None,
-                   help="Alias for --fwd_pretrain_epochs (run_all.py compat)")
-
-    p.add_argument("--warmup",      type=int,  default=100)
-    p.add_argument("--max_lambda",  type=float,default=100.0)
-    p.add_argument("--batch_size",  type=int,  default=8)
-    p.add_argument("--lr",          type=float,default=1e-4)
-    p.add_argument("--seed",        type=int,  default=42)
-    p.add_argument("--inv_hidden_dim",         type=int, default=256)
-    p.add_argument("--fwd_hidden_dim",         type=int, default=512)
+                   help="Phase 2: inv training with fwd guidance (notebook EPOCHS_PHASE_2)")
+    p.add_argument("--fwd_epochs",          type=int,  default=None)
+    p.add_argument("--inv_pretrain_epochs", type=int,  default=0,
+                   help="Stage 0: inverse-only pre-training epochs (0 = skip)")
+    p.add_argument("--warmup",              type=int,  default=100,
+                   help="notebook WARMUP_EPOCHS_PHASE_2")
+    p.add_argument("--max_lambda",          type=float,default=100.0,
+                   help="notebook MAX_LAMBDA_FWD")
+    p.add_argument("--batch_size",          type=int,  default=8)
+    p.add_argument("--lr",                  type=float,default=1e-4)
+    p.add_argument("--lr_phase2",           type=float,default=None,
+                   help="LR for Phase 2. Default=same as --lr. Set lower (e.g. 1e-5) "
+                        "to avoid disrupting Stage 0 weights.")
+    p.add_argument("--seed",                type=int,  default=42)
+    p.add_argument("--inv_hidden_dim",      type=int,  default=256)
+    p.add_argument("--fwd_hidden_dim",      type=int,  default=512)
     p.add_argument("--num_interaction_layers", type=int, default=8)
-    p.add_argument("--gat_heads",   type=int,  default=16)
-    p.add_argument("--num_gnn_proc_layers",    type=int, default=4)
-    p.add_argument("--val_every",   type=int,  default=10)
+    p.add_argument("--gat_heads",           type=int,  default=16)
+    p.add_argument("--num_gnn_proc_layers", type=int,  default=4)
+    p.add_argument("--val_every",           type=int,  default=10)
     args = p.parse_args()
 
-    # Handle alias
     if args.fwd_epochs is not None:
         args.fwd_pretrain_epochs = args.fwd_epochs
 
@@ -206,21 +178,22 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     with open("data/processed/ogw_data.pkl", "rb") as f:
-        raw_data_map = pickle.load(f)
+        raw = pickle.load(f)
 
     train_ids, val_ids, test_ids = get_train_val_test_ids(
-        args.split, list(raw_data_map.keys()), seed=args.seed)
+        args.split, list(raw.keys()), seed=args.seed)
 
     mode_label = "Coupled" if args.mode == "coupled" else "Inverse Only"
     full_label = f"WaveGraphNet ({mode_label})"
     print(f"\n{'='*65}")
     print(f"  {full_label} | split={args.split} seed={args.seed}")
-    print(f"  Stage I={args.inv_pretrain_epochs}ep (inv) | "
-          f"Stage II={args.fwd_pretrain_epochs}ep (fwd) | "
-          f"Stage III={args.epochs}ep (joint) | λ_max={args.max_lambda}")
+    print(f"  Stage0(inv)={args.inv_pretrain_epochs}ep | "
+          f"Phase1(fwd)={args.fwd_pretrain_epochs}ep | "
+          f"Phase2(coupled)={args.epochs}ep | "
+          f"λ_max={args.max_lambda} warmup={args.warmup}")
     print(f"{'='*65}", flush=True)
 
-    stats     = build_all_stats(raw_data_map, train_ids)
+    stats     = build_all_stats(raw, train_ids)
     norm_data = stats["normalized_data_map"]
 
     ds_kw = dict(
@@ -243,138 +216,129 @@ def main():
 
     n_prop    = len(stats["propagation_pair_indices"])
     inv_model = GNN_inv_HierarchicalAttention(
-        hidden_dim             = args.inv_hidden_dim,
-        raw_node_feat_dim      = 2,
-        num_attention_freqs    = N_ATTENTION_FREQS,
-        num_gnn_proc_layers    = args.num_gnn_proc_layers,
-        gat_attention_heads    = args.gat_heads,
-        decoder_mlp_hidden_dim = args.inv_hidden_dim,
-        final_output_dim       = 2,
-        decoder_pooling_type   = "max",
+        hidden_dim=args.inv_hidden_dim, raw_node_feat_dim=2,
+        num_attention_freqs=N_ATTENTION_FREQS,
+        num_gnn_proc_layers=args.num_gnn_proc_layers,
+        gat_attention_heads=args.gat_heads,
+        decoder_mlp_hidden_dim=args.inv_hidden_dim,
+        final_output_dim=2, decoder_pooling_type="max",
     ).to(device)
     fwd_model = DirectPathAttenuationGNN(
-        raw_node_feat_dim      = 2,
-        physical_edge_feat_dim = 6,
-        hidden_dim             = args.fwd_hidden_dim,
-        num_propagation_pairs  = n_prop,
-        num_interaction_layers = args.num_interaction_layers,
+        raw_node_feat_dim=2, physical_edge_feat_dim=6,
+        hidden_dim=args.fwd_hidden_dim, num_propagation_pairs=n_prop,
+        num_interaction_layers=args.num_interaction_layers,
     ).to(device)
 
     prop_ei   = stats["propagation_edge_index"]
     ckpt_path = checkpoint_path(args.split, full_label, args.seed)
-    # Keep intermediate best checkpoints for Stage I and II
-    ckpt_s1   = ckpt_path.replace(".pt", "_stage1_inv_best.pt")
-    ckpt_s2   = ckpt_path.replace(".pt", "_stage2_fwd_best.pt")
+    ckpt_fwd  = ckpt_path.replace(".pt", "_fwd_best.pt")
     logger    = EpochLogger(args.split, full_label, args.seed)
+
+    loss_fn_inv = nn.MSELoss()
+    loss_fn_fwd = nn.MSELoss()
 
     best_val_mae  = float("inf")
     best_test_mae = float("nan")
     best_test_mse = float("nan")
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Stage I: Inverse pre-training
-    # ──────────────────────────────────────────────────────────────────────────
-    print(f"\n{'─'*65}")
-    print(f"  STAGE I: Inverse pre-training ({args.inv_pretrain_epochs} epochs)")
-    print(f"{'─'*65}", flush=True)
+    # ── Stage 0: optional inverse pre-training ────────────────────────────────
+    if args.inv_pretrain_epochs and args.inv_pretrain_epochs > 0:
+        print(f"\n--- Stage 0: Inverse pre-training ({args.inv_pretrain_epochs} epochs) ---",
+              flush=True)
+        opt_inv_s0  = optim.Adam(inv_model.parameters(), lr=args.lr)
+        sch_inv_s0  = optim.lr_scheduler.ReduceLROnPlateau(opt_inv_s0, factor=0.8, patience=20)
+        best_s0_mae = float("inf")
+        ckpt_s0     = ckpt_path.replace(".pt", "_stage0_inv_best.pt")
 
-    opt_inv_s1  = optim.Adam(inv_model.parameters(), lr=args.lr)
-    sch_inv_s1  = optim.lr_scheduler.ReduceLROnPlateau(opt_inv_s1, factor=0.8, patience=20)
-    best_s1_mae = float("inf")
+        for ep in range(1, args.inv_pretrain_epochs + 1):
+            inv_model.train()
+            total_s0 = 0.0
+            for batch in tqdm(tr, leave=False, disable=_TQDM_DISABLE):
+                opt_inv_s0.zero_grad()
+                di = batch["data_inv"].to(device)
+                yt = batch["y_true"].to(device).squeeze(1)
+                loss = loss_fn_inv(inv_model(di), yt)
+                loss.backward(); opt_inv_s0.step()
+                total_s0 += loss.item() * di.num_graphs
+            total_s0 /= len(tr.dataset)
 
-    for ep in range(1, args.inv_pretrain_epochs + 1):
-        il = train_stage1_inv(inv_model, tr, opt_inv_s1, device)
+            if ep % args.val_every == 0 or ep in (1, args.inv_pretrain_epochs):
+                vm  = euclidean_mae(inv_model, vl, device)
+                vmm = vm * PLATE_MM
+                sch_inv_s0.step(vm)
+                tm, tmm = evaluate_test(inv_model, te, device)
+                logger.log(ep, "S0_inv", total_s0, vm, vmm, tm, tmm,
+                           lr=opt_inv_s0.param_groups[0]["lr"])
 
-        if ep % args.val_every == 0 or ep in (1, args.inv_pretrain_epochs):
-            vm  = euclidean_mae(inv_model, vl, device)
-            vmm = vm * PLATE_MM
-            sch_inv_s1.step(vm)
-            tm, tmm = evaluate_test(inv_model, te, device)
-            logger.log(ep, "S1_inv", il, vm, vmm, tm, tmm,
-                       lr=opt_inv_s1.param_groups[0]["lr"])
+                if vmm < best_val_mae:
+                    best_val_mae  = vmm
+                    best_test_mae = tmm
+                    best_test_mse = tm
+                    save_checkpoint(ckpt_path, config=vars(args),
+                                    test_loss=tm, val_loss=vmm,
+                                    inv_model=inv_model.state_dict(),
+                                    fwd_model=fwd_model.state_dict())
+                    print(f"  ★ [S0] Ep {ep:04d} | ValMAE={vmm:.1f}mm → "
+                          f"TestMAE={tmm:.1f}mm [saved]", flush=True)
 
-            if vmm < best_s1_mae:
-                best_s1_mae = vmm
-                torch.save(inv_model.state_dict(), ckpt_s1)
+                if vmm < best_s0_mae:
+                    best_s0_mae = vmm
+                    torch.save(inv_model.state_dict(), ckpt_s0)
 
-            if vmm < best_val_mae:
-                best_val_mae  = vmm
-                best_test_mae = tmm
-                best_test_mse = tm
-                save_checkpoint(ckpt_path, config=vars(args), test_loss=tm,
-                                val_loss=vmm, inv_model=inv_model.state_dict(),
-                                fwd_model=fwd_model.state_dict())
-                print(f"  ★ [S1] Ep {ep:04d} ValMAE={vmm:.1f}mm → "
-                      f"TestMAE={tmm:.1f}mm [saved]", flush=True)
+        inv_model.load_state_dict(torch.load(ckpt_s0, map_location=device))
+        print(f"  Stage 0 done. Best val MAE={best_s0_mae:.1f}mm → loaded.", flush=True)
 
-    # Load best Stage I inverse for Stage III initialization
-    print(f"  Stage I best val MAE={best_s1_mae:.1f}mm → loading best inv.",
-          flush=True)
-    inv_model.load_state_dict(torch.load(ckpt_s1, map_location=device))
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Stage II: Forward pre-training (only if coupled mode)
-    # ──────────────────────────────────────────────────────────────────────────
+    # ── Phase 1: forward pre-training ─────────────────────────────────────────
     if args.mode == "coupled" and args.fwd_pretrain_epochs > 0:
-        print(f"\n{'─'*65}")
-        print(f"  STAGE II: Forward pre-training ({args.fwd_pretrain_epochs} epochs)")
-        print(f"{'─'*65}", flush=True)
-
-        opt_fwd_s2  = optim.Adam(fwd_model.parameters(), lr=args.lr)
-        sch_fwd_s2  = optim.lr_scheduler.ReduceLROnPlateau(opt_fwd_s2, factor=0.8, patience=20)
-        best_s2_fwd = float("inf")
+        print(f"\n--- Phase 1: Forward pre-training ({args.fwd_pretrain_epochs} epochs) ---",
+              flush=True)
+        opt_fwd = optim.Adam(fwd_model.parameters(), lr=args.lr)
+        sch_fwd = optim.lr_scheduler.ReduceLROnPlateau(opt_fwd, factor=0.8, patience=20)
+        best_fwd_loss = float("inf")
 
         for ep in range(1, args.fwd_pretrain_epochs + 1):
-            fl = train_stage2_fwd(fwd_model, tr, opt_fwd_s2, prop_ei, device)
-            sch_fwd_s2.step(fl)
-
+            fl = train_phase1_fwd(fwd_model, tr, opt_fwd, prop_ei, device)
+            sch_fwd.step(fl)
             if ep % args.val_every == 0 or ep in (1, args.fwd_pretrain_epochs):
-                print(f"  [S2 Fwd] Ep {ep:04d} | FwdLoss={fl:.6f} "
-                      f"| LR={opt_fwd_s2.param_groups[0]['lr']:.2e}", flush=True)
+                print(f"  [P1 Fwd] Ep {ep:04d} | Loss={fl:.6f} "
+                      f"| LR={opt_fwd.param_groups[0]['lr']:.2e}", flush=True)
+            if fl < best_fwd_loss:
+                best_fwd_loss = fl
+                torch.save(fwd_model.state_dict(), ckpt_fwd)
 
-            if fl < best_s2_fwd:
-                best_s2_fwd = fl
-                torch.save(fwd_model.state_dict(), ckpt_s2)
+        fwd_model.load_state_dict(torch.load(ckpt_fwd, map_location=device))
+        print(f"  Phase 1 done. Best fwd loss={best_fwd_loss:.6f}", flush=True)
 
-        print(f"  Stage II best fwd loss={best_s2_fwd:.6f} → loading best fwd.",
-              flush=True)
-        fwd_model.load_state_dict(torch.load(ckpt_s2, map_location=device))
+    # ── Phase 2: inv training with fwd guidance (fwd frozen) ──────────────────
+    print(f"\n--- Phase 2: {mode_label} ({args.epochs} epochs) "
+          f"[fwd frozen, only opt_inv updated] ---", flush=True)
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Stage III: Joint coupled training (BOTH models trained together)
-    # ──────────────────────────────────────────────────────────────────────────
-    print(f"\n{'─'*65}")
-    print(f"  STAGE III: Joint {'coupled' if args.mode=='coupled' else 'inverse-only'} "
-          f"training ({args.epochs} epochs)")
-    print(f"{'─'*65}", flush=True)
+    # ONLY inv_model parameters — this is what makes fwd frozen
+    _lr_p2  = args.lr_phase2 if args.lr_phase2 is not None else args.lr
+    opt_inv = optim.Adam(inv_model.parameters(), lr=_lr_p2)
+    sch_inv = optim.lr_scheduler.ReduceLROnPlateau(opt_inv, factor=0.8, patience=20)
 
-    if args.mode == "coupled":
-        # BOTH models in the optimizer — this is the key fix
-        opt_joint = optim.Adam(
-            list(inv_model.parameters()) + list(fwd_model.parameters()),
-            lr=args.lr
-        )
-    else:
-        # Inverse only (no forward loss)
-        opt_joint = optim.Adam(inv_model.parameters(), lr=args.lr)
-
-    sch_joint = optim.lr_scheduler.ReduceLROnPlateau(opt_joint, factor=0.8, patience=20)
+    # Reset best_val_mae for Phase 2 (Stage 0 metric is incomparable)
+    if args.inv_pretrain_epochs and args.inv_pretrain_epochs > 0:
+        best_val_mae  = float("inf")
+        best_test_mae = float("nan")
+        best_test_mse = float("nan")
 
     for epoch in range(1, args.epochs + 1):
-        lam = get_lambda(epoch - 1, args.epochs, args.warmup, args.max_lambda) \
-              if args.mode == "coupled" else 0.0
+        lam = 1.0#get_lambda(epoch - 1, args.epochs, args.warmup, args.max_lambda) \
+              #if args.mode == "coupled" else 0.0
 
-        l_inv, l_fwd = train_stage3_joint(
-            inv_model, fwd_model, tr, opt_joint, lam, prop_ei, device)
+        l_inv, l_fwd = train_phase2_inv(
+            inv_model, fwd_model, tr, opt_inv,
+            loss_fn_inv, loss_fn_fwd, lam, prop_ei, device)
 
         if epoch % args.val_every == 0 or epoch in (1, args.epochs):
             vm  = euclidean_mae(inv_model, vl, device)
             vmm = vm * PLATE_MM
-            sch_joint.step(vm)
-
+            sch_inv.step(vm)
             tm, tmm = evaluate_test(inv_model, te, device)
-            logger.log(epoch, "S3_jnt", l_inv, vm, vmm, tm, tmm,
-                       lambda_fwd=lam, lr=opt_joint.param_groups[0]["lr"])
+            logger.log(epoch, "P2_inv", l_inv, vm, vmm, tm, tmm,
+                       lambda_fwd=lam, lr=opt_inv.param_groups[0]["lr"])
 
             if vmm < best_val_mae:
                 best_val_mae  = vmm
@@ -384,7 +348,7 @@ def main():
                                 test_loss=tm, val_loss=vmm,
                                 inv_model=inv_model.state_dict(),
                                 fwd_model=fwd_model.state_dict())
-                print(f"  ★ [S3] Ep {epoch:04d} | ValMAE={vmm:.1f}mm → "
+                print(f"  ★ Ep {epoch:04d} | ValMAE={vmm:.1f}mm → "
                       f"TestMAE={tmm:.1f}mm TestMSE={tm:.5f} [saved]", flush=True)
 
     logger.close()

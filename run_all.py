@@ -13,7 +13,7 @@ from collections import defaultdict
 PAPER_GLOBAL_ARGS = [
     "--lr",         "1e-4",
     "--batch_size", "8",
-    "--epochs",     "500",
+    "--epochs",     "1000",
     # FFT bins and lookback are now determined by physical constants
     # inside utils/precompute.py (69.4-128 kHz, 256 bins, 13108-pt FFT).
 ]
@@ -39,7 +39,7 @@ PAPER_SCRIPTS = [
 
     ("main_wavegraphnet.py",
      ["--mode", "inverse_only",
-      "--inv_hidden_dim", "256", "--fwd_hidden_dim", "512",
+      "--inv_hidden_dim", "256", "--fwd_hidden_dim", "128",
       "--num_interaction_layers", "8", "--gat_heads", "16",
       "--num_gnn_proc_layers", "4",
       "--inv_pretrain_epochs", "500",
@@ -49,7 +49,7 @@ PAPER_SCRIPTS = [
 
     ("main_wavegraphnet.py",
      ["--mode", "coupled",
-      "--inv_hidden_dim", "256", "--fwd_hidden_dim", "512",
+      "--inv_hidden_dim", "256", "--fwd_hidden_dim", "128",
       "--num_interaction_layers", "8", "--gat_heads", "16",
       "--num_gnn_proc_layers", "4",
       "--inv_pretrain_epochs", "500",

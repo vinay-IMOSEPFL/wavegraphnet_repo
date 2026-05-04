@@ -7,3 +7,32 @@ Traceback (most recent call last):
   File "/home/visharma/gnn/WAVEGRAPHNET/main_wavegraphnet_trial.py", line 301, in main
     print(f"  Stage1={args.stage1_epochs}ep | Stage2={args.stage2_inv_epochs}ep | "
 AttributeError: 'Namespace' object has no attribute 'stage2_inv_epochs'. Did you mean: 'stage2_fwd_epochs'?
+
+  Split A │ Train: 20D+48B=68 │ Val (['D13', 'D27', 'D9']): 3D+6B=9 │ Test (['D21', 'D22', 'D23', 'D24', 'D25', 'D4']): 7D+6B=13
+
+=================================================================
+  WaveGraphNet (Coupled) | split=A seed=42
+  Stage0(inv)=0ep | Phase1(fwd)=500ep | Phase2(coupled)=500ep | λ_max=100.0 warmup=100
+=================================================================
+─ Step 0+1: Baseline subtraction + time-domain z-normalization …
+Traceback (most recent call last):
+  File "/home/visharma/gnn/WAVEGRAPHNET/main_wavegraphnet.py", line 367, in <module>
+    main()
+  File "/home/visharma/gnn/WAVEGRAPHNET/main_wavegraphnet.py", line 201, in main
+    stats     = build_all_stats(raw, train_ids)
+  File "/home/visharma/gnn/WAVEGRAPHNET/utils/precompute.py", line 218, in build_all_stats
+    norm_data, _, _, _ = build_normalized_differential_data(raw_data_map, train_ids)
+  File "/home/visharma/gnn/WAVEGRAPHNET/utils/precompute.py", line 55, in build_normalized_differential_data
+    stacked  = np.stack([raw_data_map[s][:min_len] for s in baseline_train_ids], axis=0)
+  File "/home/visharma/gnn/venv/lib/python3.10/site-packages/numpy/core/shape_base.py", line 456, in stack
+    return _nx.concatenate(expanded_arrays, axis=axis, out=out,
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/home/visharma/gnn/WAVEGRAPHNET/main_wavegraphnet.py", line 38, in <module>
+    from models.wavegraphnet import GNN_inv_HierarchicalAttention, DirectPathAttenuationGNN
+  File "/home/visharma/gnn/WAVEGRAPHNET/models/wavegraphnet.py", line 7, in <module>
+    from models.layers import NodeEncoder, GraphDecoder
+  File "/home/visharma/gnn/WAVEGRAPHNET/models/layers.py", line 94
+    CUDA_VISIBLE_DEVICES=1 nohup python -u main_wavegraphnet.py   --split B --mode coupled --seed 0   --inv_hidden_dim 256 --fwd_hidden_dim 128   --num_interaction_layers 3 --gat_heads 16 --num_gnn_proc_layers 4   --inv_pretrain_epochs 200 --fwd_pretrain_epochs 200 -
+                           ^^^^^
+SyntaxError: invalid syntax

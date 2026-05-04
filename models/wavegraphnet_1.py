@@ -213,7 +213,8 @@ class DirectPathAttenuationGNN(nn.Module):
         self.decoder = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1)
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Sigmoid(),   # geometric influence target ∈ (0,1]
         )
 
     def forward(self, graph_sensors_fwd: PyGData, damage_locs: torch.Tensor):

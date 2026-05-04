@@ -62,6 +62,8 @@ class CoupledModelDataset(TorchDataset):
         fwd_propagation_col_idxs, fixed_fft_bin_indices,
         amp_means, amp_stds, lookback_fft,
         average_baseline_energy_profile, global_max_delta_e,
+        fwd_prop_edge_index=None,   # [2, 72] propagation edges for geometric target
+        geometric_sigma=0.1,        # scale in normalized coords (0.1 = 50mm)
     ):
         self.data_map = data_map
         self.sample_id_list = sample_id_list
@@ -84,6 +86,18 @@ class CoupledModelDataset(TorchDataset):
         )
         self.avg_baseline = average_baseline_energy_profile  # [66, 256]
 
+        # Geometric influence target (Option D)
+        # If fwd_prop_edge_index provided, use geometric target instead of delta_e
+        self.geometric_sigma = geometric_sigma
+        if fwd_prop_edge_index is not None:
+            # prop_ei has 72 directed edges (36 pairs × 2); even indices = one direction
+            self.prop_src = fwd_prop_edge_index[0, 0::2].tolist()  # 36 src transducer idxs
+            self.prop_dst = fwd_prop_edge_index[1, 0::2].tolist()  # 36 dst transducer idxs
+            self.use_geometric_target = True
+        else:
+            self.prop_src = None
+            self.prop_dst = None
+            self.use_geometric_target = False
 
     def __len__(self):
         return len(self.sample_id_list)
@@ -123,12 +137,27 @@ class CoupledModelDataset(TorchDataset):
             xd, yd = DAMAGE_LABELS[dmg]
         y_true = torch.tensor([[xd, yd]], dtype=torch.float)
 
-        # Forward branch target: normalised path-wise energy deviation
-        # Mirrors the notebook pipeline exactly.
-        cur_energy   = torch.abs(norm_amps)                           # [66, 256]
-        delta_e      = (cur_energy - self.avg_baseline).mean(dim=-1).clamp(min=0)  # [66]
-        delta_e_prop = delta_e[self.prop_pair_indices]                # [36]
-        delta_e_norm = delta_e_prop / self.global_max_delta_e
+        # Forward branch target
+        if self.use_geometric_target:
+            # Option D: geometric path influence — purely from damage location + geometry
+            # influence_ij = 1 / (1 + excess_ij / sigma)
+            # excess_ij = ||p-ri|| + ||p-rj|| - ||rj-ri||  (extra travel distance)
+            # Range [0,1]: 1 when damage is on path, decays as damage moves away.
+            # Works for undamaged sentinel too (gives low influence, masked in training).
+            coords = self.node_coords  # [12, 2]
+            p = torch.tensor([xd, yd], dtype=torch.float32)  # damage coord
+            influences = []
+            for s, d in zip(self.prop_src, self.prop_dst):
+                ri = coords[s]; rj = coords[d]
+                excess = ((p-ri).norm() + (p-rj).norm() - (rj-ri).norm()).clamp(min=0)
+                influences.append(1.0 / (1.0 + excess / self.geometric_sigma))
+            delta_e_norm = torch.stack(influences)                        # [36] in (0,1]
+        else:
+            # Option A: signed signal-derived delta-E (remove clamp)
+            cur_energy   = torch.abs(norm_amps)                           # [66, 256]
+            delta_e      = (cur_energy - self.avg_baseline).mean(dim=-1)  # [66] signed
+            delta_e_prop = delta_e[self.prop_pair_indices]                # [36]
+            delta_e_norm = delta_e_prop / self.global_max_delta_e
 
         return {
             "data_inv": data_inv,
