@@ -80,51 +80,109 @@ def train_phase1_fwd(fwd_model, loader, opt_fwd, prop_ei, device):
     return total / len(loader.dataset)
 
 
-# ── Phase 2: inverse training with frozen forward ─────────────────────────────
+# ── Phase 2: inverse training with physics correction loss ────────────────────
 def train_phase2_inv(inv_model, fwd_model, loader, opt_inv,
-                     loss_fn_inv, loss_fn_fwd, lambda_fwd, prop_ei, device):
+                     loss_fn_inv, loss_fn_fwd, lambda_fwd, prop_ei, device,
+                     mu=1.0, alpha=0.05):
+    """
+    Physics Correction Loss — uses the forward model as an explicit oracle.
+
+    Three terms:
+      L_loc       = MSE(p̂, p_true)                  standard localization
+      L_fwd       = MSE(fwd(p̂), ΔE_obs)             energy consistency
+      L_corrected = MSE(p̂_physics, p_true)           physics correction supervision
+
+    where p̂_physics = p̂ - α · (∂L_probe/∂p̂) / ||∂L_probe/∂p̂||
+    is the prediction after one physics-guided gradient step in coordinate space.
+
+    L_probe = MSE(fwd(p̂_detached), ΔE_obs) is computed with a detached probe
+    so the physics gradient is w.r.t. the coordinate directly, not through
+    the inverse model. This gives an explicit coordinate-space correction vector.
+
+    The correction term teaches the inverse: produce predictions that,
+    after one physics step, land on the true location. This forces the inverse
+    to predict on the physics manifold — not just close to truth but in a
+    direction physics agrees with.
+
+    Forward model is frozen (eval). Only opt_inv updated.
+    Damaged samples only for L_fwd and L_corrected.
+    """
     inv_model.train()
-    fwd_model.eval()
-    crit = nn.MSELoss()
-    tot_inv = tot_fwd = 0.0
+    fwd_model.eval()   # frozen throughout
+    tot_inv = tot_fwd = tot_corr = 0.0
 
     for batch in tqdm(loader, leave=False, disable=_TQDM_DISABLE):
         opt_inv.zero_grad()
+
         di = batch["data_inv"].to(device)
-        yt = batch["y_true"].to(device).squeeze(1)
-        de = batch["delta_e_true"].to(device)
+        yt = batch["y_true"].to(device).squeeze(1)   # [B, 2]
+        de = batch["delta_e_true"].to(device)         # [B, 36]
 
-        predicted_locs = inv_model(di)
+        p_hat = inv_model(di)                         # [B, 2]
+        dmg_mask = yt[:, 0] > 0                       # damaged samples only
 
-        dmg_mask = yt[:, 0] > 0
-        ud_mask  = ~dmg_mask
+        # ── Term 1: standard localization loss ───────────────────────────────
+        loss_inv = loss_fn_inv(p_hat, yt)
 
-        # Damaged: exact coordinate regression
-        loss_inv = crit(predicted_locs[dmg_mask], yt[dmg_mask]) \
-                   if dmg_mask.any() else torch.tensor(0.0, device=device)
+        loss_fwd  = torch.tensor(0.0, device=device)
+        loss_corr = torch.tensor(0.0, device=device)
 
-        # Undamaged: soft plate-exit penalty (not exact sentinel)
-        if ud_mask.any():
-            px = torch.clamp(predicted_locs[ud_mask, 0], min=0.0)
-            py = torch.clamp(predicted_locs[ud_mask, 1], min=0.0)
-            loss_inv = loss_inv + (px**2 + py**2).mean()
-
-        # Forward consistency on damaged only
-        loss_fwd = torch.tensor(0.0, device=device)
         if lambda_fwd > 0 and dmg_mask.any():
             gf = make_fwd_batch(di, prop_ei, device)
-            loss_fwd = loss_fn_fwd(
-                fwd_model(gf, predicted_locs)[dmg_mask], de[dmg_mask])
 
-        (loss_inv + lambda_fwd * loss_fwd).backward()
+            # ── Term 2: energy consistency (existing, no detach on p_hat) ───
+            pred_de = fwd_model(gf, p_hat)            # [B, 36]
+            loss_fwd = loss_fn_fwd(pred_de[dmg_mask], de[dmg_mask])
+
+            # ── Term 3: physics correction supervision ───────────────────────
+            # Probe: detach p_hat from inv graph, require grad w.r.t. coords
+            # This computes the gradient of forward error IN COORDINATE SPACE
+            # without flowing back through the inverse model parameters yet.
+            p_probe = p_hat[dmg_mask].detach().requires_grad_(True)
+
+            # Build fwd batch for damaged samples only
+            di_dmg = di.__class__(
+                x=di.x, edge_index=di.edge_index,
+                batch=di.batch
+            ) if not hasattr(di, 'edge_attr') else di
+            # Use full gf but index damaged rows of output
+            de_dmg_obs = de[dmg_mask]                 # [n_dmg, 36] observed ΔE
+
+            # Forward pass at probe location
+            p_full_probe = p_hat.detach().clone()
+            p_full_probe[dmg_mask] = p_probe
+            pred_de_probe = fwd_model(gf, p_full_probe)  # [B, 36]
+
+            # Physics gradient in coordinate space: ∂MSE(fwd(p_probe), ΔE)/∂p_probe
+            L_probe = loss_fn_fwd(pred_de_probe[dmg_mask], de_dmg_obs)
+            physics_grad = torch.autograd.grad(
+                L_probe, p_probe,
+                create_graph=False,   # we only need the direction, not higher-order
+                retain_graph=False,
+            )[0]                      # [n_dmg, 2]
+
+            # Normalize to unit length: correction is a DIRECTION, not a magnitude
+            grad_norm = physics_grad.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            physics_grad_unit = physics_grad / grad_norm
+
+            # One physics correction step in coordinate space
+            p_hat_corrected = p_hat[dmg_mask] - alpha * physics_grad_unit  # [n_dmg, 2]
+
+            # Supervise corrected prediction against true location
+            loss_corr = loss_fn_inv(p_hat_corrected, yt[dmg_mask])
+
+        # ── Total loss ───────────────────────────────────────────────────────
+        total_loss = loss_inv + lambda_fwd * loss_fwd + mu * loss_corr
+        total_loss.backward()
         opt_inv.step()
 
         n = di.num_graphs
-        tot_inv += loss_inv.item() * n
-        tot_fwd += loss_fwd.item() * n
+        tot_inv  += loss_inv.item()  * n
+        tot_fwd  += loss_fwd.item()  * n
+        tot_corr += loss_corr.item() * n
 
     n = len(loader.dataset)
-    return tot_inv / n, tot_fwd / n
+    return tot_inv / n, tot_fwd / n, tot_corr / n
 
 
 def euclidean_mae(model, loader, device):
@@ -143,7 +201,7 @@ def euclidean_mae(model, loader, device):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--split",               default="A", choices=["A", "B"])
+    p.add_argument("--split",               default="A", choices=["A", "B" , "B2"])
     p.add_argument("--mode",                default="coupled",
                    choices=["coupled", "inverse_only"])
     p.add_argument("--fwd_pretrain_epochs", type=int,  default=500,
@@ -162,6 +220,12 @@ def main():
     p.add_argument("--lr_phase2",           type=float,default=None,
                    help="LR for Phase 2. Default=same as --lr. Set lower (e.g. 1e-5) "
                         "to avoid disrupting Stage 0 weights.")
+    p.add_argument("--mu",                  type=float,default=1.0,
+                   help="Weight of physics correction loss L_corrected. "
+                        "mu=0 disables correction and reduces to standard coupling.")
+    p.add_argument("--alpha",               type=float,default=0.05,
+                   help="Physics correction step size in normalized coordinate space. "
+                        "Controls how far the physics gradient moves the prediction.")
     p.add_argument("--seed",                type=int,  default=42)
     p.add_argument("--inv_hidden_dim",      type=int,  default=256)
     p.add_argument("--fwd_hidden_dim",      type=int,  default=512)
@@ -325,12 +389,13 @@ def main():
         best_test_mse = float("nan")
 
     for epoch in range(1, args.epochs + 1):
-        lam = 1.0#get_lambda(epoch - 1, args.epochs, args.warmup, args.max_lambda) \
-              #if args.mode == "coupled" else 0.0
+        lam = get_lambda(epoch - 1, args.epochs, args.warmup, args.max_lambda) \
+              if args.mode == "coupled" else 0.0
 
-        l_inv, l_fwd = train_phase2_inv(
+        l_inv, l_fwd, l_corr = train_phase2_inv(
             inv_model, fwd_model, tr, opt_inv,
-            loss_fn_inv, loss_fn_fwd, lam, prop_ei, device)
+            loss_fn_inv, loss_fn_fwd, lam, prop_ei, device,
+            mu=args.mu, alpha=args.alpha)
 
         if epoch % args.val_every == 0 or epoch in (1, args.epochs):
             vm  = euclidean_mae(inv_model, vl, device)
@@ -339,6 +404,8 @@ def main():
             tm, tmm = evaluate_test(inv_model, te, device)
             logger.log(epoch, "P2_inv", l_inv, vm, vmm, tm, tmm,
                        lambda_fwd=lam, lr=opt_inv.param_groups[0]["lr"])
+            if lam > 0:
+                print(f"  [P2] Ep {epoch:04d} l_fwd={l_fwd:.5f} l_corr={l_corr:.5f}", flush=True)
 
             if vmm < best_val_mae:
                 best_val_mae  = vmm

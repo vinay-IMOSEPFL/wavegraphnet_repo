@@ -33,6 +33,15 @@ _SPLITS = {
         # D7 (upper-center), D15 (center-right), D25 (bottom-center)
         "val"  : ["D7",  "D15", "D25"],
     },
+    "B2": {
+        # Same test as B — both outer corner clusters
+        "test" : ["D1", "D2", "D3", "D4", "D21", "D22", "D23", "D24"],
+        # Expanded val: 6 zones spread across plate interior
+        # D5  (upper-left), D7  (upper-center), D9  (center-left)
+        # D15 (center-right), D20 (lower-center), D25 (bottom-center)
+        # ~8-10 damaged val samples → ±12mm noise vs ±25mm for Split B
+        "val"  : ["D5", "D7", "D9", "D15", "D20", "D25"],
+    },
 }
 
 
@@ -59,7 +68,7 @@ def get_train_val_test_ids(
     """
     key = split_name.upper()
     if key not in _SPLITS:
-        raise ValueError(f"Unknown split '{split_name}'. Choose A or B.")
+        raise ValueError(f"Unknown split '{split_name}'. Choose A, B, or B2.")
 
     cfg = _SPLITS[key]
     test_labels = set(cfg["test"])
