@@ -225,7 +225,6 @@ class DirectPathAttenuationGNN(nn.Module):
 
         vec = source_nodes_coords - dest_nodes_coords
 
-        # CRITICAL FIX 2: Epsilon-smoothed geometric distances to prevent NaN gradients
         eps = 1e-8
 
         edge_length = torch.sqrt(vec.pow(2).sum(dim=-1, keepdim=True) + eps)
