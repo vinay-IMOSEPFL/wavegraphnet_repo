@@ -24,9 +24,9 @@ import random
 # ── Spatial split definitions ─────────────────────────────────────────────────
 _SPLITS = {
     "A": {
-        "test" : ["D4",  "D21", "D22", "D23", "D24", "D25"],
+        "test" : ["D21", "D22", "D23", "D24", "D25"],
         # D9 (center-left), D13 (center-right), D27 (bottom-center)
-        "val"  : ["D9",  "D13", "D27"],
+        "val"  : ["D4", "D9",  "D13", "D27"],
     },
     "B": {
         "test" : ["D1", "D2", "D3", "D4", "D21", "D22", "D23", "D24"],
