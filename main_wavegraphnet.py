@@ -1,7 +1,7 @@
 """
-WaveGraphNet — faithful implementation of the coupling-models.ipynb notebook.
+WaveGraphNet
 
-Training protocol (exactly as in the notebook):
+Training protocol :
 
   Phase 1  (--fwd_pretrain_epochs, default 500):
     Pre-train forward model with ground-truth coordinates.
@@ -20,7 +20,6 @@ Training protocol (exactly as in the notebook):
     Scheduler steps on eval MAE.
     Best checkpoint by val MAE.
 
-Note: INV_ONLY_EPOCHS=0 in the notebook — no separate inverse pre-training.
 """
 import argparse, sys, random, pickle, os
 import torch, torch.nn as nn, torch.optim as optim
@@ -185,6 +184,50 @@ def train_phase2_inv(inv_model, fwd_model, loader, opt_inv,
     return tot_inv / n, tot_fwd / n, tot_corr / n
 
 
+
+def compute_val_score(inv_model, fwd_model, loader, prop_ei, device, ckpt_alpha):
+    """
+    Combined validation score for Phase 2 checkpoint selection.
+
+    score = val_MSE_loc + ckpt_alpha * val_MSE_fwd
+
+    val_MSE_loc: MSE(p̂, p_true) on damaged val samples     → ~7 samples
+    val_MSE_fwd: MSE(fwd(p̂), ΔE_obs) on damaged val samples → 7×36=252 values
+
+    The fwd term has 36x more values per sample → much lower variance → 
+    the combined score is far more stable than val_MAE alone.
+    Only computed in Phase 2 (after forward model is pretrained).
+    No saving happens in Stage 0 or Phase 1 — only Phase 2 saves.
+    """
+    inv_model.eval(); fwd_model.eval()
+    crit = nn.MSELoss()
+    tot_loc = tot_fwd = tot_eucl = 0.0
+    n_dmg = 0
+
+    with torch.no_grad():
+        for batch in loader:
+            di = batch["data_inv"].to(device)
+            yt = batch["y_true"].to(device).squeeze(1)
+            de = batch["delta_e_true"].to(device)
+            mask = yt[:, 0] > 0
+            if not mask.any():
+                continue
+            pc = inv_model(di)
+            tot_loc  += crit(pc[mask], yt[mask]).item() * mask.sum().item()
+            tot_eucl += torch.sqrt(((pc[mask] - yt[mask])**2).sum(dim=1)).mean().item()
+            n_dmg    += 1
+            if ckpt_alpha > 0:
+                gf = make_fwd_batch(di, prop_ei, device)
+                tot_fwd += crit(fwd_model(gf, pc)[mask], de[mask]).item() * mask.sum().item()
+
+    total_dmg = max(sum((b["y_true"].squeeze(1)[:,0]>0).sum().item() for b in loader), 1)
+    mse_loc = tot_loc  / total_dmg
+    mse_fwd = tot_fwd  / total_dmg
+    mae_mm  = (tot_eucl / max(n_dmg, 1)) * PLATE_MM
+    score   = mse_loc + ckpt_alpha * mse_fwd
+    return mse_loc, mse_fwd, mae_mm, score
+
+
 def euclidean_mae(model, loader, device):
     model.eval(); total = 0.0; count = 0
     with torch.no_grad():
@@ -201,7 +244,7 @@ def euclidean_mae(model, loader, device):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--split",               default="A", choices=["A", "B" , "B2"])
+    p.add_argument("--split",               default="A", choices=["A", "B", "B2"])
     p.add_argument("--mode",                default="coupled",
                    choices=["coupled", "inverse_only"])
     p.add_argument("--fwd_pretrain_epochs", type=int,  default=500,
@@ -226,6 +269,11 @@ def main():
     p.add_argument("--alpha",               type=float,default=0.05,
                    help="Physics correction step size in normalized coordinate space. "
                         "Controls how far the physics gradient moves the prediction.")
+    p.add_argument("--ckpt_alpha",           type=float,default=1.0,
+                   help="Weight of val_MSE_fwd in checkpoint score. "
+                        "score = val_MSE_loc + ckpt_alpha * val_MSE_fwd. "
+                        "Using fwd term (252 values) is much more stable than "
+                        "val_MAE alone (7 samples). Default=1.0 (equal weight).")
     p.add_argument("--seed",                type=int,  default=42)
     p.add_argument("--inv_hidden_dim",      type=int,  default=256)
     p.add_argument("--fwd_hidden_dim",      type=int,  default=512)
@@ -382,11 +430,11 @@ def main():
     opt_inv = optim.Adam(inv_model.parameters(), lr=_lr_p2)
     sch_inv = optim.lr_scheduler.ReduceLROnPlateau(opt_inv, factor=0.8, patience=20)
 
-    # Reset best_val_mae for Phase 2 (Stage 0 metric is incomparable)
-    if args.inv_pretrain_epochs and args.inv_pretrain_epochs > 0:
-        best_val_mae  = float("inf")
-        best_test_mae = float("nan")
-        best_test_mse = float("nan")
+    # Phase 2 checkpoint uses combined score — always reset to avoid
+    # Stage 0 val_mae (different metric) blocking Phase 2 saves
+    best_p2_score = float("inf")
+    best_test_mae = float("nan")
+    best_test_mse = float("nan")
 
     for epoch in range(1, args.epochs + 1):
         lam = get_lambda(epoch - 1, args.epochs, args.warmup, args.max_lambda) \
@@ -398,30 +446,36 @@ def main():
             mu=args.mu, alpha=args.alpha)
 
         if epoch % args.val_every == 0 or epoch in (1, args.epochs):
-            vm  = euclidean_mae(inv_model, vl, device)
-            vmm = vm * PLATE_MM
-            sch_inv.step(vm)
+            mse_loc, mse_fwd, vmm, score = compute_val_score(
+                inv_model, fwd_model, vl, prop_ei, device, args.ckpt_alpha)
+            vm = vmm / PLATE_MM
+            sch_inv.step(mse_loc)
             tm, tmm = evaluate_test(inv_model, te, device)
             logger.log(epoch, "P2_inv", l_inv, vm, vmm, tm, tmm,
                        lambda_fwd=lam, lr=opt_inv.param_groups[0]["lr"])
+            print(f"[{full_label}] Ep {epoch:04d} │ P2_inv │ "
+                  f"MSEloc={mse_loc:.5f} MSEfwd={mse_fwd:.5f} "
+                  f"score={score:.5f} MAE={vmm:.1f}mm │ "
+                  f"Test={tmm:.1f}mm │ λ={lam:.2f}", flush=True)
             if lam > 0:
-                print(f"  [P2] Ep {epoch:04d} l_fwd={l_fwd:.5f} l_corr={l_corr:.5f}", flush=True)
+                print(f"  [P2] l_fwd={l_fwd:.5f} l_corr={l_corr:.5f}", flush=True)
 
-            if vmm < best_val_mae:
-                best_val_mae  = vmm
+            if score < best_p2_score:
+                best_p2_score = score
                 best_test_mae = tmm
                 best_test_mse = tm
                 save_checkpoint(ckpt_path, config=vars(args),
-                                test_loss=tm, val_loss=vmm,
+                                test_loss=tm, val_loss=score,
                                 inv_model=inv_model.state_dict(),
                                 fwd_model=fwd_model.state_dict())
-                print(f"  ★ Ep {epoch:04d} | ValMAE={vmm:.1f}mm → "
-                      f"TestMAE={tmm:.1f}mm TestMSE={tm:.5f} [saved]", flush=True)
+                print(f"  ★ Ep {epoch:04d} | score={score:.5f} "
+                      f"(loc={mse_loc:.5f}+{args.ckpt_alpha}×fwd={mse_fwd:.5f}) → "
+                      f"TestMAE={tmm:.1f}mm [saved]", flush=True)
 
     logger.close()
     log_result(args.split, f"{full_label} (seed={args.seed})", best_test_mse)
-    log_mae_result(args.split, full_label, args.seed, best_val_mae, best_test_mae)
-    print(f"\n[DONE] {full_label} | best_val_mae={best_val_mae:.1f}mm | "
+    log_mae_result(args.split, full_label, args.seed, best_p2_score * PLATE_MM, best_test_mae)
+    print(f"\n[DONE] {full_label} | best_p2_score={best_p2_score:.5f} | "
           f"test_mae={best_test_mae:.1f}mm | test_mse={best_test_mse:.5f}", flush=True)
 
 

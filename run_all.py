@@ -1,143 +1,145 @@
-import subprocess
-import argparse
-import sys
-import json
-import os
-import statistics
+"""
+WaveGraphNet — GPU-parallel evaluation pipeline.
+
+Runs all models across all seeds, 3 at a time (one per GPU).
+Results written to results_mae.json (MAE localization only).
+
+Usage:
+  # Split B2
+  python run_all.py --split B2 --gpus 0 1 2 --seeds 0 1 42
+
+  # Split A
+  python run_all.py --split A --gpus 0 1 2 --seeds 0 1 42
+
+  # Quick smoke test (2 epochs)
+  python run_all.py --split B2 --gpus 0 1 2 --seeds 0 --quick
+"""
+import subprocess, argparse, sys, json, os, time, statistics
 from collections import defaultdict
 
+# ── Model configurations ───────────────────────────────────────────────────────
+# Each entry: (script, extra_args, label)
+# WaveGraphNet 900-epoch budget:
+#   Inverse Only: 900ep Stage 0 + 0ep fwd + 0ep Phase2   = 900 total
+#   Coupled:      150ep Stage 0 + 150ep fwd + 600ep Phase2 = 900 total
 
-# ---------------------------------------------------------------------------
-# Paper-exact configuration (from paper Table)
-# ---------------------------------------------------------------------------
-PAPER_GLOBAL_ARGS = [
-    "--lr",         "1e-4",
-    "--batch_size", "8",
-    "--epochs",     "1000",
-    # FFT bins and lookback are now determined by physical constants
-    # inside utils/precompute.py (69.4-128 kHz, 256 bins, 13108-pt FFT).
-]
-
-# (script, script-specific args, display label)
-PAPER_SCRIPTS = [
+MODELS = [
     ("main_cnn.py",
-     [],
+     ["--epochs", "900"],
      "1D CNN"),
 
     ("main_lstm.py",
-     ["--lstm_hidden_dim", "256", "--num_lstm_layers", "3", "--dropout", "0.3"],
+     ["--lstm_hidden_dim", "256", "--num_lstm_layers", "3", "--dropout", "0.3",
+      "--epochs", "900"],
      "LSTM"),
 
     ("main_gnn_baselines.py",
-     ["--model", "simple_mlp", "--hidden_dim", "256", "--num_gnn_layers", "4"],
+     ["--model", "simple_mlp", "--hidden_dim", "256", "--num_gnn_layers", "4",
+      "--epochs", "900"],
      "GNN (simple_mlp)"),
 
     ("main_gnn_baselines.py",
      ["--model", "attention", "--hidden_dim", "256",
-      "--num_gnn_layers", "4", "--gat_heads", "16"],
+      "--num_gnn_layers", "4", "--gat_heads", "16",
+      "--epochs", "900"],
      "GNN (attention)"),
 
-    ("main_wavegraphnet.py",
-     ["--mode", "inverse_only",
-      "--inv_hidden_dim", "256", "--fwd_hidden_dim", "128",
-      "--num_interaction_layers", "8", "--gat_heads", "16",
-      "--num_gnn_proc_layers", "4",
-      "--inv_pretrain_epochs", "500",
-      "--fwd_pretrain_epochs", "500",
-      "--warmup", "100", "--max_lambda", "100"],
+    # Inverse Only — dedicated script, 900 epochs, no forward model
+    ("main_wavegraphnet_inv.py",
+     ["--inv_hidden_dim", "256", "--num_gnn_proc_layers", "4", "--gat_heads", "16",
+      "--fwd_hidden_dim", "128", "--num_interaction_layers", "3",
+      "--epochs", "900",
+      "--lr", "1e-4"],
      "WaveGraphNet (Inverse Only)"),
 
+    # Coupled — 150+150+600 = 900 epochs, physics correction active
     ("main_wavegraphnet.py",
      ["--mode", "coupled",
-      "--inv_hidden_dim", "256", "--fwd_hidden_dim", "128",
-      "--num_interaction_layers", "8", "--gat_heads", "16",
-      "--num_gnn_proc_layers", "4",
-      "--inv_pretrain_epochs", "500",
-      "--fwd_pretrain_epochs", "500",
-      "--warmup", "100", "--max_lambda", "100"],
-     "WaveGraphNet (Coupled)")
+      "--inv_hidden_dim", "256", "--num_gnn_proc_layers", "4", "--gat_heads", "16",
+      "--fwd_hidden_dim", "128", "--num_interaction_layers", "3",
+      "--inv_pretrain_epochs", "150",
+      "--fwd_pretrain_epochs", "150",
+      "--epochs", "600",
+      "--warmup", "40", "--max_lambda", "3",
+      "--mu", "1.0", "--alpha", "0.1", "--ckpt_alpha", "1.0",
+      "--lr", "1e-4", "--lr_phase2", "1e-5"],
+     "WaveGraphNet (Coupled)"),
 ]
 
-# Default scripts (when --paper is NOT set)
-DEFAULT_SCRIPTS = [
-    ("main_cnn.py",              [],                         "1D CNN"),
-    ("main_lstm.py",             [],                         "LSTM"),
-    ("main_gnn_baselines.py",    [],                         "GNN (simple_mlp)"),
-    ("main_wavegraphnet.py",     ["--mode", "inverse_only"], "WaveGraphNet (Inverse Only)"),
-    ("main_wavegraphnet.py",     ["--mode", "coupled"],      "WaveGraphNet (Coupled)"),
-]
-# ---------------------------------------------------------------------------
+QUICK_EPOCHS = "2"
+GLOBAL_EPOCHS = "900"  # same budget for all models
 
 
-def _set_or_replace(arg_list, flag, value):
-    """Insert or overwrite a --flag value pair in an arg list in-place."""
-    if flag in arg_list:
-        arg_list[arg_list.index(flag) + 1] = value
-    else:
-        arg_list.extend([flag, value])
+
+def build_cmd(script, extra_args, split, seed, gpu, quick):
+    """Build the full subprocess command for one run."""
+    cmd = [
+        sys.executable, script,
+        "--split", split,
+        "--seed",  str(seed),
+    ] + extra_args
+
+    if quick:
+        # Override all epoch-related flags to 2 for smoke testing
+        epoch_flags = [
+            "--epochs", "--inv_pretrain_epochs",
+            "--fwd_pretrain_epochs", "--fwd_epochs",
+        ]
+        seen = set()
+        new_cmd = []
+        skip_next = False
+        for i, tok in enumerate(cmd):
+            if skip_next:
+                skip_next = False
+                new_cmd.append(QUICK_EPOCHS)
+                continue
+            if tok in epoch_flags and tok not in seen:
+                seen.add(tok)
+                new_cmd.append(tok)
+                skip_next = True
+            else:
+                new_cmd.append(tok)
+        cmd = new_cmd
+
+    env = dict(os.environ)
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    return cmd, env
 
 
-def run_script(script_name, split, seed, quick_mode=False, extra_args=None):
-    """Build and execute one child training command."""
-    cmd = [sys.executable, script_name, "--split", split, "--seed", str(seed)]
-    if extra_args:
-        cmd.extend(extra_args)
-    if quick_mode:
-        _set_or_replace(cmd, "--epochs", "2")
-        # Also reduce WaveGraphNet-specific long-running flags
-        for flag in ("--fwd_epochs", "--inv_pretrain_epochs", "--fwd_pretrain_epochs",
-                     "--stage1_epochs", "--stage2_inv_epochs",
-                     "--inv_per_cycle", "--fwd_per_cycle"):
-            _set_or_replace(cmd, flag, "2")
-
-    print(f"\n{'=' * 65}")
-    print(f"Executing: {' '.join(cmd)}")
-    print(f"{'=' * 65}")
-    subprocess.run(cmd, check=True)
+def log_path(script, split, seed):
+    label = script.replace(".py", "").replace("main_", "")
+    return f"logs/run_{label}_{split}_seed{seed}.log"
 
 
-def print_leaderboard(split, seeds, results_path="results.json"):
-    """Print mean ± std across seeds from results.json."""
-    if not os.path.exists(results_path):
-        print("results.json not found.")
-        return
+def run_batch(batch, quick):
+    """Launch a batch of (cmd, env, logfile) concurrently, wait for all."""
+    procs = []
+    for cmd, env, logfile in batch:
+        os.makedirs(os.path.dirname(logfile), exist_ok=True)
+        print(f"  → {' '.join(cmd[:6])} ... seed={cmd[cmd.index('--seed')+1]} "
+              f"[GPU {env['CUDA_VISIBLE_DEVICES']}]")
+        f = open(logfile, "w")
+        p = subprocess.Popen(cmd, env=env, stdout=f, stderr=f)
+        procs.append((p, f, logfile))
+        time.sleep(2)   # stagger launches to avoid race on data loading
 
-    with open(results_path, "r") as f:
-        try:
-            all_results = json.load(f)
-        except json.JSONDecodeError:
-            print("Could not read results.json.")
-            return
-
-    split_data = all_results.get(split, {})
-    if not split_data:
-        print(f"No results logged for Split {split}.")
-        return
-
-    # Group entries by base model name (strip " (seed=N)" suffix).
-    grouped = defaultdict(list)
-    for key, loss in split_data.items():
-        base = key.rsplit(" (seed=", 1)[0]
-        grouped[base].append(loss)
-
-    print(f"\n\n{'=' * 62}")
-    print(f"  FINAL BASELINE RESULTS  |  SPLIT {split}  |  seeds={seeds}")
-    print(f"{'=' * 62}")
-    print(f"{'Model Name':<36} | {'Mean MSE':>10} | {'Std':>8}")
-    print("-" * 62)
-    for model, losses in sorted(grouped.items(), key=lambda x: statistics.mean(x[1])):
-        mean = statistics.mean(losses)
-        std  = statistics.stdev(losses) if len(losses) > 1 else 0.0
-        print(f"{model:<36} | {mean:>10.6f} | {std:>8.6f}")
+    print(f"  Waiting for {len(procs)} processes …")
+    failed = []
+    for p, f, logfile in procs:
+        rc = p.wait()
+        f.close()
+        if rc != 0:
+            failed.append((logfile, rc))
+            print(f"  [ERROR] {logfile} exited with code {rc}")
+        else:
+            print(f"  [DONE]  {logfile}")
+    return failed
 
 
 def print_mae_leaderboard(split, seeds, results_path="results_mae.json"):
-    """Print mean ± std MAE (mm) across seeds from results_mae.json."""
-    import statistics as st
     if not os.path.exists(results_path):
-        print("results_mae.json not found — no MAE summary available.")
+        print("results_mae.json not found.")
         return
-
     with open(results_path) as f:
         try:
             data = json.load(f)
@@ -147,7 +149,7 @@ def print_mae_leaderboard(split, seeds, results_path="results_mae.json"):
 
     split_data = data.get(split, {})
     if not split_data:
-        print(f"No MAE results logged for Split {split}.")
+        print(f"No MAE results for Split {split}.")
         return
 
     rows = []
@@ -155,136 +157,97 @@ def print_mae_leaderboard(split, seeds, results_path="results_mae.json"):
         maes = [e["test_mae_mm"] for e in entries
                 if isinstance(e, dict) and "test_mae_mm" in e]
         if maes:
-            rows.append((model_name, st.mean(maes),
-                         st.stdev(maes) if len(maes) > 1 else 0.0,
+            rows.append((model_name,
+                         statistics.mean(maes),
+                         statistics.stdev(maes) if len(maes) > 1 else 0.0,
                          len(maes)))
-
     rows.sort(key=lambda r: r[1])
 
-    print(f"\n\n{'='*65}")
-    print(f"  FINAL MAE RESULTS  |  SPLIT {split}  |  seeds={seeds}")
+    print(f"\n{'='*65}")
+    print(f"  MAE RESULTS  |  SPLIT {split}  |  seeds={seeds}")
     print(f"{'='*65}")
-    print(f"{'Model Name':<38} | {'Mean MAE':>10} | {'Std':>8} | n")
+    print(f"{'Model':<38} | {'Mean MAE':>9} | {'Std':>7} | n")
     print("-" * 65)
     for name, mean, std, n in rows:
-        print(f"{name:<38} | {mean:>8.1f}mm | {std:>6.1f}mm | {n}")
+        print(f"{name:<38} | {mean:>7.1f}mm | {std:>5.1f}mm | {n}")
     print(f"{'='*65}")
 
-    # Also write to a log file for nohup runs
-    log_path = f"mae_summary_split{split}.log"
-    with open(log_path, "w") as f:
+    log = f"mae_summary_split{split}.log"
+    with open(log, "w") as f:
         f.write(f"SPLIT {split} | seeds={seeds}\n")
-        f.write(f"{'Model':<38} | {'Mean MAE':>10} | {'Std':>8}\n")
-        f.write("-" * 65 + "\n")
+        f.write(f"{'Model':<38} | {'Mean MAE':>9} | {'Std':>7}\n")
+        f.write("-"*65+"\n")
         for name, mean, std, n in rows:
-            f.write(f"{name:<38} | {mean:>8.1f}mm | {std:>6.1f}mm\n")
-    print(f"[Saved] MAE summary → {log_path}", flush=True)
+            f.write(f"{name:<38} | {mean:>7.1f}mm | {std:>5.1f}mm\n")
+    print(f"[Saved] → {log}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run the full WaveGraphNet evaluation pipeline.")
-    parser.add_argument("--split", type=str, default="B", choices=["A", "B"])
-    parser.add_argument("--skip_data", action="store_true",
-                        help="Skip the data preparation phase")
-    parser.add_argument("--quick", action="store_true",
-                        help="Smoke test: force 2 epochs per model")
+    p = argparse.ArgumentParser()
+    p.add_argument("--split",  default="B2", choices=["A", "B", "B2"])
+    p.add_argument("--gpus",   type=int, nargs="+", default=[0, 1, 2],
+                   help="GPU IDs to use. Max concurrent jobs = len(gpus).")
+    p.add_argument("--seeds",  type=int, nargs="+", default=[0, 1, 42])
+    p.add_argument("--quick",  action="store_true",
+                   help="Smoke test: force 2 epochs per model")
+    p.add_argument("--models", type=int, nargs="+", default=None,
+                   help="Run only specific model indices (0-5). Default: all.")
+    args = p.parse_args()
 
-    # ---- paper preset ----
-    parser.add_argument("--paper", action="store_true",
-                        help="Use exact paper hyperparameters: "
-                             "lr=1e-4, batch=8, epochs=500, "
-                             "per-model hidden dims, seeds {0,1,42}")
+    n_gpus = len(args.gpus)
+    models = [MODELS[i] for i in args.models] if args.models else MODELS
 
-    # ---- manual overrides (work both with and without --paper) ----
-    parser.add_argument("--epochs",       type=int,   default=None,
-                        help="Override number of training epochs")
-    parser.add_argument("--batch_size",   type=int,   default=None,
-                        help="Override batch size")
-    parser.add_argument("--lr",           type=float, default=None,
-                        help="Override learning rate")
+    # Build full list of (script, extra_args, label, split, seed, gpu, logfile)
+    jobs = []
+    gpu_idx = 0
+    for seed in args.seeds:
+        for script, extra_args, label in models:
+            gpu = args.gpus[gpu_idx % n_gpus]
+            logfile = log_path(f"{script}_{label.replace(' ','_')}", args.split, seed)
+            cmd, env = build_cmd(script, extra_args, args.split, seed, gpu, args.quick)
+            jobs.append((cmd, env, logfile))
+            gpu_idx += 1
 
-    # ---- seed control ----
-    parser.add_argument("--seeds", type=int, nargs="+", default=None,
-                        help="Random seeds to average over. "
-                             "Default: [42] normally, [0,1,42] with --paper")
-    args = parser.parse_args()
+    total = len(jobs)
+    print(f"\n{'='*65}")
+    print(f"  WaveGraphNet Pipeline | Split={args.split} | "
+          f"Seeds={args.seeds} | GPUs={args.gpus}")
+    print(f"  {total} jobs, {n_gpus} at a time")
+    print(f"{'='*65}\n")
 
-    # ------------------------------------------------------------------ #
-    # Resolve effective configuration                                       #
-    # ------------------------------------------------------------------ #
-    if args.paper:
-        scripts   = PAPER_SCRIPTS
-        base_args = list(PAPER_GLOBAL_ARGS)
-        seeds     = args.seeds or [0, 1, 42]
+    # Clear previous results for this split
+    for rfile in ("results.json", "results_mae.json"):
+        if os.path.exists(rfile):
+            with open(rfile) as f:
+                try:
+                    d = json.load(f)
+                except json.JSONDecodeError:
+                    d = {}
+            d.pop(args.split, None)
+            with open(rfile, "w") as f:
+                json.dump(d, f, indent=4)
+
+    # Run in batches of n_gpus
+    all_failed = []
+    for i in range(0, total, n_gpus):
+        batch = jobs[i:i + n_gpus]
+        batch_num = i // n_gpus + 1
+        total_batches = (total + n_gpus - 1) // n_gpus
+        print(f"\n── Batch {batch_num}/{total_batches} "
+              f"(jobs {i+1}–{min(i+n_gpus, total)}/{total}) ──")
+        failed = run_batch(batch, args.quick)
+        all_failed.extend(failed)
+
+    # Final leaderboard
+    print_mae_leaderboard(args.split, args.seeds)
+
+    if all_failed:
+        print(f"\n[WARNING] {len(all_failed)} job(s) failed:")
+        for logfile, rc in all_failed:
+            print(f"  {logfile} (exit code {rc})")
+        sys.exit(1)
     else:
-        scripts   = DEFAULT_SCRIPTS
-        base_args = []
-        seeds     = args.seeds or [42]
-
-    # Apply any manual overrides on top.
-    for flag, val in [
-        ("--epochs",       args.epochs),
-        ("--batch_size",   args.batch_size),
-        ("--lr",           args.lr),
-    ]:
-        if val is not None:
-            _set_or_replace(base_args, flag, str(val))
-
-    # ------------------------------------------------------------------ #
-    # Clear previous results for this split                                #
-    # ------------------------------------------------------------------ #
-    if not args.quick:
-        for rfile in ("results.json", "results_mae.json"):
-            if os.path.exists(rfile):
-                with open(rfile, "r") as f:
-                    try:
-                        all_results = json.load(f)
-                    except json.JSONDecodeError:
-                        all_results = {}
-                all_results.pop(args.split, None)
-                with open(rfile, "w") as f:
-                    json.dump(all_results, f, indent=4)
-
-    # ------------------------------------------------------------------ #
-    # Data preparation                                                      #
-    # ------------------------------------------------------------------ #
-    if not args.skip_data:
-        print("Preparing Data...")
-        try:
-            subprocess.run([sys.executable, "data/prepare_data.py"], check=True)
-        except subprocess.CalledProcessError:
-            print("Data preparation failed. Exiting.")
-            sys.exit(1)
-
-    # ------------------------------------------------------------------ #
-    # Training loop — seeds × scripts                                      #
-    # ------------------------------------------------------------------ #
-    for seed in seeds:
-        print(f"\n{'#' * 65}")
-        print(f"#  SEED = {seed}")
-        print(f"{'#' * 65}")
-
-        for script, script_extra, _label in scripts:
-            # Script-specific args come first so global base_args can override.
-            combined = script_extra + base_args
-            try:
-                run_script(
-                    script,
-                    args.split,
-                    seed=seed,
-                    quick_mode=args.quick,
-                    extra_args=combined or None,
-                )
-            except subprocess.CalledProcessError:
-                print(f"\n[ERROR] {script} with args {combined} failed. "
-                      "Exiting pipeline.")
-                sys.exit(1)
-
-    # ------------------------------------------------------------------ #
-    # Leaderboard                                                           #
-    # ------------------------------------------------------------------ #
-    print_leaderboard(args.split, seeds)
-    print_mae_leaderboard(args.split, seeds)
+        print(f"\n[DONE] All {total} jobs completed successfully.")
 
 
 if __name__ == "__main__":

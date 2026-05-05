@@ -32,7 +32,7 @@ def _euclidean_mae(model, loader, device):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--split",          default="A", choices=["A","B"])
+    p.add_argument("--split",          default="A", choices=["A","B","B2"])
     p.add_argument("--model",          default="simple_mlp", choices=["simple_mlp","attention"])
     p.add_argument("--epochs",         type=int,  default=500)
     p.add_argument("--batch_size",     type=int,  default=8)

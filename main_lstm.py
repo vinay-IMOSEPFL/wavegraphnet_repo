@@ -1,9 +1,6 @@
 """
 Bidirectional LSTM baseline — spectral features.
 
-FIX vs previous version:
-  • Uses build_all_stats() → normalized_data_map, matching all other models.
-  • amp_means/amp_stds from normalized differential data (not raw signals).
 """
 import argparse, sys, random, pickle
 import torch, torch.nn as nn, torch.optim as optim
@@ -74,7 +71,7 @@ def _euclidean_mae(model, loader, device) -> float:
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--split",           default="A", choices=["A", "B"])
+    p.add_argument("--split",           default="A", choices=["A", "B", "B2"])
     p.add_argument("--epochs",          type=int,   default=500)
     p.add_argument("--batch_size",      type=int,   default=8)
     p.add_argument("--lr",              type=float, default=1e-4)
